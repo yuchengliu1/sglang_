@@ -4401,7 +4401,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         assert len(self.skip_topk_layers) == layer_num
 
-        if _is_hip:
+        if _is_hip or _is_cpu:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert (
                     self.page_size % 16 == 0
