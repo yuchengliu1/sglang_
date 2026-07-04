@@ -404,6 +404,8 @@ at::Tensor fp8_paged_mqa_logits_cpu(
     int64_t max_seq_len,
     bool clean_logits);
 
+at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tensor& k_s);
+
 // quant
 std::tuple<at::Tensor, at::Tensor>
 act_quant_cpu(at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt);
@@ -943,6 +945,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_paged_mqa_logits_cpu(Tensor q_fp8, Tensor kvcache_fp8, Tensor weight, Tensor seq_lens, "
       "Tensor page_table, int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits_cpu", torch::kCPU, &fp8_paged_mqa_logits_cpu);
+
+  // DSA indexer FP8 index score (ragged loop path)
+  m.def("fp8_index_cpu(Tensor q, Tensor q_s, Tensor k, Tensor k_s) -> Tensor");
+  m.impl("fp8_index_cpu", torch::kCPU, &fp8_index_cpu);
 
   // flash mla with kvcache
   m.def(
