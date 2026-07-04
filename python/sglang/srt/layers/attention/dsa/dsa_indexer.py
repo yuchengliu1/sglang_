@@ -1461,6 +1461,113 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         return topk_result
 
+    def forward_indexer(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+        topk: int,
+        layer_id: int,
+    ) -> Optional[torch.Tensor]:
+        assert not _is_in_piecewise_or_breakable_cuda_graph(), (
+            "DSA forward_indexer (non-CUDA loop path) not supported under "
+            "piecewise/breakable CUDA graph"
+        )
+        if not (_is_npu or _is_cpu):
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
+        elif _is_cpu and _cpu_amx:
+            from sglang.srt.layers.attention.dsa.cpu_kernel import fp8_index
+            from sglang.srt.layers.attention.dsa.index_buf_accessor import GetK, GetS
+
+        kv_pool = get_token_to_kv_pool()
+        page_size = kv_pool.page_size
+        # assert page_size == 64, f"only support page size 64, but get {page_size}"
+
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(-1)
+
+        topk_indices_list = []
+
+        block_tables = get_req_to_token_pool().req_to_token[
+            forward_batch.req_pool_indices, :
+        ]
+        strided_indices = torch.arange(
+            0,
+            block_tables.shape[-1],
+            page_size,
+            device=block_tables.device,
+        )
+        block_tables = block_tables[:, strided_indices] // page_size
+        if _is_cpu and _cpu_amx:
+            index_k_with_scale_buffer = kv_pool.get_index_k_with_scale_buffer(layer_id)
+
+        q_len_start = 0
+
+        for i in range(forward_batch.batch_size):
+            seq_len = forward_batch.seq_lens[i].item()
+            q_len = (
+                forward_batch.extend_seq_lens_cpu[i]
+                if forward_batch.forward_mode.is_extend()
+                else 1
+            )
+            q_len_end = q_len_start + q_len
+
+            q_fp8_partial = q_fp8[q_len_start:q_len_end]
+            q_fp8_partial = q_fp8_partial.unsqueeze(0).contiguous()
+
+            weights_partial = weights[q_len_start:q_len_end]
+            weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
+
+            if _is_cpu and _cpu_amx:
+                k_fp8 = GetK.torch_fast(
+                    kv_pool,
+                    index_k_with_scale_buffer,
+                    seq_len,
+                    block_tables[i],
+                )
+                k_scale = GetS.torch_fast(
+                    kv_pool,
+                    index_k_with_scale_buffer,
+                    seq_len,
+                    block_tables[i],
+                )
+            else:
+                k_fp8 = kv_pool.get_index_k_continuous(
+                    layer_id,
+                    seq_len,
+                    block_tables[i],
+                )
+                k_scale = kv_pool.get_index_k_scale_continuous(
+                    layer_id,
+                    seq_len,
+                    block_tables[i],
+                )
+
+            k_fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+            k_fp8 = k_fp8.view(k_fp8_dtype).unsqueeze(0).contiguous()
+            k_scale = k_scale.view(torch.float32).squeeze(-1).unsqueeze(0).contiguous()
+
+            index_score = fp8_index(
+                q_fp8_partial,
+                weights_partial,
+                k_fp8,
+                k_scale,
+            )
+            end_pos = seq_len
+            topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
+
+            pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
+            topk_indices = torch.nn.functional.pad(
+                topk_indices, (0, pad_len), "constant", -1
+            )
+
+            topk_indices_list.append(topk_indices)
+
+            q_len_start = q_len_end
+
+        topk_indices = torch.cat(topk_indices_list, dim=0)
+        return topk_indices
+
     def _store_index_k_cache(
         self,
         forward_batch: ForwardBatch,
