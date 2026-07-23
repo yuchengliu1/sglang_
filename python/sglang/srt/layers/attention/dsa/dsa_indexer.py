@@ -69,8 +69,9 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-
-if not _is_npu:
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
+if not (_is_npu or _is_cpu):
     from sglang.kernels.ops.attention.dsa import (
         aiter_paged_mqa_logits,
         cutedsl_paged_mqa_logits,
@@ -91,8 +92,6 @@ else:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-_is_cpu = is_cpu()
-_cpu_amx = cpu_has_amx_support()
 
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
@@ -1488,8 +1487,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         topk_indices_list = []
 
+        # Truncate to the batch's actual max sequence length before the
+        # strided page reindexing below. `req_to_token` rows are sized to the
+        # pool's full preallocated capacity (often 100k+ slots), not the
+        # current context length; without this truncation, GetK.torch_fast/
+        # GetS.torch_fast (and the block_tables slicing itself) build and
+        # gather index tensors over the ENTIRE capacity every single call
+        # (every layer, every decode step) even though only the first
+        # `seq_len` positions are ever used (everything past `seq_len` gets
+        # sliced away inside GetK/GetS anyway) - purely wasted compute that
+        # dominates CPU decode latency. Mirrors the truncation already done
+        # in IntelAMXAttnBackend._init_dsa_metadata's `page_table`.
+        max_seq_len = int(forward_batch.seq_lens.max().item())
         block_tables = get_req_to_token_pool().req_to_token[
-            forward_batch.req_pool_indices, :
+            forward_batch.req_pool_indices, :max_seq_len
         ]
         strided_indices = torch.arange(
             0,
@@ -2055,7 +2066,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
-        query, key = self._get_q_k_bf16(
+        query, key, weights_raw = self._get_q_k_bf16(
             q_lora, x, positions, False, forward_batch=forward_batch
         )
         q_fp8, q_scale = act_quant_cpu(query, self.block_size, self.scale_fmt)
