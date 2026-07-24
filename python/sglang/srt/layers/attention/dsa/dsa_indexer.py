@@ -1476,7 +1476,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
         elif _is_cpu and _cpu_amx:
             from sglang.srt.layers.attention.dsa.cpu_kernel import fp8_index
-            from sglang.srt.layers.attention.dsa.index_buf_accessor import GetK, GetS
+            from sglang.srt.layers.attention.dsa.index_buf_accessor import GetKAndS
 
         kv_pool = get_token_to_kv_pool()
         page_size = kv_pool.page_size
@@ -1530,13 +1530,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
 
             if _is_cpu and _cpu_amx:
-                k_fp8 = GetK.torch_fast(
-                    kv_pool,
-                    index_k_with_scale_buffer,
-                    seq_len,
-                    block_tables[i],
-                )
-                k_scale = GetS.torch_fast(
+                k_fp8, k_scale = GetKAndS.execute_cpu(
                     kv_pool,
                     index_k_with_scale_buffer,
                     seq_len,

@@ -541,6 +541,22 @@ void set_k_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k, int64_t pa
 // set_s
 void set_s_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k_scale, int64_t page_size, int64_t index_head_dim);
 
+// get_k
+at::Tensor get_k_cpu(
+    at::Tensor& buf,
+    at::Tensor& page_indices,
+    int64_t seq_len,
+    int64_t page_size,
+    int64_t index_head_dim);
+
+// get_s
+at::Tensor get_s_cpu(
+    at::Tensor& buf,
+    at::Tensor& page_indices,
+    int64_t seq_len,
+    int64_t page_size,
+    int64_t index_head_dim);
+
 // compressor
 at::Tensor compress_decode_cpu(
     at::Tensor& pool_kv,
@@ -1074,6 +1090,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "set_s_cpu(Tensor(a!) buf, Tensor loc, Tensor index_k_scale, "
       "int page_size, int index_head_dim) -> ()");
   m.impl("set_s_cpu", torch::kCPU, &set_s_cpu);
+
+  // get_k
+  m.def(
+      "get_k_cpu(Tensor buf, Tensor page_indices, int seq_len, "
+      "int page_size, int index_head_dim) -> Tensor");
+  m.impl("get_k_cpu", torch::kCPU, &get_k_cpu);
+
+  // get_s
+  m.def(
+      "get_s_cpu(Tensor buf, Tensor page_indices, int seq_len, "
+      "int page_size, int index_head_dim) -> Tensor");
+  m.impl("get_s_cpu", torch::kCPU, &get_s_cpu);
 
   // quant_to_nope_fp8_rope_bf16_pack
   m.def("quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");

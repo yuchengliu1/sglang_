@@ -383,6 +383,113 @@ void set_s_cpu(
   });
 }
 
+// get_k_cpu: gather index key data (fp8, viewed as uint8) from a paged buffer
+// for NSA index cache. CPU counterpart of the K half of `_get_k_and_s_triton`.
+//
+// Buffer layout per page (buf shape: [num_pages, buf_numel_per_page]):
+//   K data region: page_size * index_head_dim bytes (fp8 key data)
+//   S data region: page_size * 4 bytes (fp32 scale per token)
+//
+// 1D-only interface: `page_indices` is a single sequence's page table of shape
+// [num_pages], and `seq_len` tokens are gathered contiguously into the output.
+//
+at::Tensor get_k_cpu(
+    at::Tensor& buf,           // [num_pages, buf_numel_per_page], uint8
+    at::Tensor& page_indices,  // [num_pages], int32 or int64
+    int64_t seq_len,
+    int64_t page_size,
+    int64_t index_head_dim) {
+  const int64_t buf_numel_per_page = buf.size(1);
+  const int64_t num_k_bytes_per_token = index_head_dim;
+
+  auto k_out = at::empty({seq_len, index_head_dim}, buf.options());
+
+  const uint8_t* buf_ptr = buf.data_ptr<uint8_t>();
+  uint8_t* k_out_ptr = k_out.data_ptr<uint8_t>();
+
+  const bool pi_is_int64 = (page_indices.scalar_type() == at::kLong);
+  const int32_t* pi_i32 = pi_is_int64 ? nullptr : page_indices.data_ptr<int32_t>();
+  const int64_t* pi_i64 = pi_is_int64 ? page_indices.data_ptr<int64_t>() : nullptr;
+
+  at::parallel_for(0, seq_len, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t g = begin; g < end; ++g) {
+      const int64_t page_idx = g / page_size;
+      const int64_t token_off = g % page_size;
+      const int64_t page_index = pi_is_int64 ? pi_i64[page_idx] : static_cast<int64_t>(pi_i32[page_idx]);
+
+      // K gather: copy index_head_dim bytes (fp8)
+      const int64_t k_src_offset = page_index * buf_numel_per_page + token_off * num_k_bytes_per_token;
+      const uint8_t* k_src = buf_ptr + k_src_offset;
+      uint8_t* k_dst = k_out_ptr + g * num_k_bytes_per_token;
+
+#if defined(CPU_CAPABILITY_AVX512)
+      // index_head_dim=128: 2 x 64-byte AVX512 loads/stores
+      {
+        int64_t d = 0;
+        for (; d + 64 <= num_k_bytes_per_token; d += 64) {
+          __m512i v = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(k_src + d));
+          _mm512_storeu_si512(reinterpret_cast<__m512i*>(k_dst + d), v);
+        }
+        if (d < num_k_bytes_per_token) {
+          std::memcpy(k_dst + d, k_src + d, num_k_bytes_per_token - d);
+        }
+      }
+#else
+      std::memcpy(k_dst, k_src, num_k_bytes_per_token);
+#endif
+    }
+  });
+
+  return k_out;
+}
+
+// get_s_cpu: gather scale data (fp32, viewed as 4 bytes uint8) from a paged
+// buffer for NSA index cache. CPU counterpart of the S half of
+// `_get_k_and_s_triton`.
+//
+// Buffer layout per page (buf shape: [num_pages, buf_numel_per_page]):
+//   K data region: page_size * index_head_dim bytes (fp8 key data)
+//   S data region: page_size * 4 bytes (fp32 scale per token)
+//
+// 1D-only interface: `page_indices` is a single sequence's page table of shape
+// [num_pages], and `seq_len` tokens are gathered contiguously into the output.
+//
+at::Tensor get_s_cpu(
+    at::Tensor& buf,           // [num_pages, buf_numel_per_page], uint8
+    at::Tensor& page_indices,  // [num_pages], int32 or int64
+    int64_t seq_len,
+    int64_t page_size,
+    int64_t index_head_dim) {
+  const int64_t buf_numel_per_page = buf.size(1);
+  const int64_t num_s_bytes_per_token = 4;  // fp32 = 4 bytes
+  const int64_t s_offset_in_page = page_size * index_head_dim;
+
+  auto s_out = at::empty({seq_len, num_s_bytes_per_token}, buf.options());
+
+  const uint8_t* buf_ptr = buf.data_ptr<uint8_t>();
+  uint8_t* s_out_ptr = s_out.data_ptr<uint8_t>();
+
+  const bool pi_is_int64 = (page_indices.scalar_type() == at::kLong);
+  const int32_t* pi_i32 = pi_is_int64 ? nullptr : page_indices.data_ptr<int32_t>();
+  const int64_t* pi_i64 = pi_is_int64 ? page_indices.data_ptr<int64_t>() : nullptr;
+
+  at::parallel_for(0, seq_len, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t g = begin; g < end; ++g) {
+      const int64_t page_idx = g / page_size;
+      const int64_t token_off = g % page_size;
+      const int64_t page_index = pi_is_int64 ? pi_i64[page_idx] : static_cast<int64_t>(pi_i32[page_idx]);
+
+      // S gather: copy 4 bytes (fp32 scale)
+      const int64_t s_src_offset =
+          page_index * buf_numel_per_page + s_offset_in_page + token_off * num_s_bytes_per_token;
+      uint8_t* s_dst = s_out_ptr + g * num_s_bytes_per_token;
+      *reinterpret_cast<uint32_t*>(s_dst) = *reinterpret_cast<const uint32_t*>(buf_ptr + s_src_offset);
+    }
+  });
+
+  return s_out;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16) {
   TORCH_CHECK(
       k_bf16.dtype() == at::kBFloat16, "quant_to_nope_fp8_rope_bf16_pack_cpu: expect bf16 input, got ", k_bf16.dtype());
