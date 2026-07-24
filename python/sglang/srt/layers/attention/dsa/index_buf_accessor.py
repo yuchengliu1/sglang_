@@ -184,6 +184,37 @@ class GetKAndS:
         return cls.triton(*args, **kwargs)
 
     @classmethod
+    def execute_cpu(
+        cls,
+        pool: "DSATokenToKVPool",
+        buf: torch.Tensor,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        # 1D-only interface: `page_indices` is a single sequence's page table
+        # of shape (num_pages,), mirroring GetK.torch_fast / GetS.torch_fast.
+        # The batched 2D interface is intentionally not supported here.
+        assert (
+            page_indices.dim() == 1
+        ), f"GetKAndS.execute_cpu only supports 1D page_indices, got shape {tuple(page_indices.shape)}"
+
+        k_out = torch.ops.sgl_kernel.get_k_cpu(
+            buf,
+            page_indices,
+            seq_len,
+            pool.page_size,
+            pool.index_head_dim,
+        )
+        s_out = torch.ops.sgl_kernel.get_s_cpu(
+            buf,
+            page_indices,
+            seq_len,
+            pool.page_size,
+            pool.index_head_dim,
+        )
+        return k_out, s_out
+
+    @classmethod
     def aiter(
         cls,
         pool: "DSATokenToKVPool",
