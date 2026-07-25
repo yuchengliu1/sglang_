@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "common.h"
+#include "vec.h"
 
 // DSA indexer FP8 index score (ragged, single-batch loop path).
 //
@@ -36,6 +37,34 @@ extern void fused_linear_relu_reduce(
 // fused_linear_relu_reduce only produces k_scale.size(0) output columns.
 constexpr int64_t kTileN = 16;
 
+// Efficient fp8_e4m3fn → bf16 conversion using CVT_FP8_TO_BF16 from vec.h.
+// Processes 32 elements per AVX512 iteration (256-bit load, 512-bit store).
+// Avoids the torch .to() path which routes through float32 intermediates.
+static void fp8_to_bf16(
+    at::BFloat16* __restrict__ dst,
+    const uint8_t* __restrict__ src,
+    int64_t n) {
+#if defined(CPU_CAPABILITY_AVX512)
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m512bh v = CVT_FP8_TO_BF16(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)v);
+  }
+  // scalar tail (< 32 elements)
+  for (; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
+#else
+  for (int64_t i = 0; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
+#endif
+}
 
 at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tensor& k_s) {
   CHECK_INPUT(q);
@@ -54,41 +83,54 @@ at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tens
   TORCH_CHECK(k_s.dim() == 2, "k_s must have shape [B, N]");
 
   const int64_t B = q.size(0);
+  // Caller always passes B=1 (one batch item per forward_indexer iteration).
+  TORCH_CHECK(B == 1, "fp8_index_cpu only supports B=1, got B=", B);
+
   const int64_t M = q.size(1);
   const int64_t H = q.size(2);
   const int64_t D = q.size(3);
   const int64_t N = k.size(1);
 
-  TORCH_CHECK(k.size(0) == B && k.size(2) == D, "k must have shape [B, N, D] matching q");
+  TORCH_CHECK(k.size(0) == 1 && k.size(2) == D, "k must have shape [1, N, D] matching q");
   TORCH_CHECK(
-      q_s.size(0) == B && q_s.size(1) == M && q_s.size(2) == H, "q_s must have shape [B, M, H] matching q");
-  TORCH_CHECK(k_s.size(0) == B && k_s.size(1) == N, "k_s must have shape [B, N] matching k");
+      q_s.size(0) == 1 && q_s.size(1) == M && q_s.size(2) == H,
+      "q_s must have shape [1, M, H] matching q");
+  TORCH_CHECK(k_s.size(0) == 1 && k_s.size(1) == N, "k_s must have shape [1, N] matching k");
 
-  auto out = at::empty({B, M, N}, q.options().dtype(at::kFloat));
-  if (B == 0 || M == 0 || N == 0) {
+  auto out = at::empty({1, M, N}, q.options().dtype(at::kFloat));
+  if (M == 0 || N == 0) {
     return out;
   }
 
   const int64_t N_pad = ((N + kTileN - 1) / kTileN) * kTileN;
   const auto bf16_opts = q.options().dtype(at::kBFloat16);
 
-  for (int64_t b = 0; b < B; ++b) {
-    at::Tensor q_bf16, k_bf16;
-    // Q[b] : [M, H, D] bf16.
-    q_bf16 = q.select(0, b).to(at::kBFloat16);
-    // K[b] : [N_pad, D] bf16, key rows padded with zeros so N_pad % 16 == 0.
-    if (N_pad == N) {
-      k_bf16 = k.select(0, b).to(at::kBFloat16);
-    } else {
-      k_bf16 = at::zeros({N_pad, D}, bf16_opts);
-      k_bf16.narrow(0, 0, N).copy_(k.select(0, b).to(at::kBFloat16));
-    }
+  // Q[0]: [1, M, H, D] fp8 → [M, H, D] bf16.
+  // B=1 + contiguous: q.data_ptr() == q[0].data_ptr(), no select needed.
+  auto q_bf16 = at::empty({M, H, D}, bf16_opts);
+  fp8_to_bf16(
+      q_bf16.data_ptr<at::BFloat16>(),
+      reinterpret_cast<const uint8_t*>(q.const_data_ptr()),
+      M * H * D);
 
-    at::Tensor q_scale_b = q_s.select(0, b);  // [M, H]
-    at::Tensor k_scale_b = k_s.select(0, b);  // [N]
-    at::Tensor out_b = out.select(0, b);      // [M, N]
-    fused_linear_relu_reduce(out_b, q_bf16, q_scale_b, k_bf16, k_scale_b, /*is_vnni=*/false);
+  // K[0]: [1, N, D] fp8 → [N_pad, D] bf16.
+  // If N_pad > N the extra rows must be zero (padding); otherwise no zeroing needed.
+  at::Tensor k_bf16;
+  if (N_pad == N) {
+    k_bf16 = at::empty({N, D}, bf16_opts);
+  } else {
+    k_bf16 = at::zeros({N_pad, D}, bf16_opts);
   }
+  fp8_to_bf16(
+      k_bf16.data_ptr<at::BFloat16>(),
+      reinterpret_cast<const uint8_t*>(k.const_data_ptr()),
+      N * D);
+
+  // Views into q_s/k_s/out — no data copies.
+  at::Tensor q_scale = q_s.select(0, 0);  // [M, H]
+  at::Tensor k_scale = k_s.select(0, 0);  // [N]
+  at::Tensor out_b   = out.select(0, 0);  // [M, N]
+  fused_linear_relu_reduce(out_b, q_bf16, q_scale, k_bf16, k_scale, /*is_vnni=*/false);
 
   return out;
 }
