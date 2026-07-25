@@ -425,6 +425,15 @@ at::Tensor fp8_paged_mqa_logits_cpu(
     int64_t max_seq_len,
     bool clean_logits);
 
+at::Tensor fp8_mqa_logits_cpu(
+    at::Tensor& q_fp8,
+    at::Tensor& k_fp8,
+    at::Tensor& k_scale,
+    at::Tensor& weight,
+    at::Tensor& ks,
+    at::Tensor& ke,
+    bool clean_logits);
+
 at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tensor& k_s);
 
 // quant
@@ -1011,6 +1020,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_paged_mqa_logits_cpu(Tensor q_fp8, Tensor kvcache_fp8, Tensor weight, Tensor seq_lens, "
       "Tensor page_table, int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits_cpu", torch::kCPU, &fp8_paged_mqa_logits_cpu);
+
+  // DSA indexer ragged (non-paged) FP8 MQA logits
+  m.def(
+      "fp8_mqa_logits_cpu(Tensor q_fp8, Tensor k_fp8, Tensor k_scale, Tensor weight, "
+      "Tensor ks, Tensor ke, bool clean_logits) -> Tensor");
+  m.impl("fp8_mqa_logits_cpu", torch::kCPU, &fp8_mqa_logits_cpu);
 
   // DSA indexer FP8 index score (ragged loop path)
   m.def("fp8_index_cpu(Tensor q, Tensor q_s, Tensor k, Tensor k_s) -> Tensor");

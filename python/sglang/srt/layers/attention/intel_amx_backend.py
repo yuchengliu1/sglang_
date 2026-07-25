@@ -178,6 +178,78 @@ class IntelAMXAttnBackend(AttentionBackend):
         )
         return page_table[:, strided_indices] // page_size
 
+    def _cal_indexer_k_start_end(
+        self,
+        forward_batch: ForwardBatch,
+        bs_idx,
+    ):
+        assert bs_idx is None
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            return None, None
+        if forward_batch.batch_size == 0:
+            empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
+            return (empty_t, empty_t), empty_t
+
+        # Suppose there are two requests, with extend_seq_len = [3, 2]
+        # and seq_lens = [10, 4]
+        # The logits matrix looks like this, with * representing the valid logits
+        # and - representing the invalid logits:
+        #
+        #  ********--|----
+        #  *********-|----
+        #  **********|----
+        #  ----------|***-
+        #  ----------|****
+        #
+        # ks = [0, 0, 0, 10, 10]
+        # ke = [8, 9, 10, 13, 14]
+        ks_list = []
+        ke_list = []
+        token_to_batch_idx = []
+
+        q_offset = 0
+        k_offset = 0
+
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+        for i in range(forward_batch.batch_size):
+            seq_len = forward_batch.seq_lens_cpu[i].item()
+            assert isinstance(seq_len, int)
+            extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
+            ks = torch.full(
+                (extend_seq_len,), k_offset, dtype=torch.int32, device=self.device
+            )
+            kv_len = seq_len
+            if forward_batch.forward_mode.is_target_verify():
+                assert False, "Target verify mode is not supported on CPU"
+            seq_lens_expanded = torch.arange(
+                kv_len - extend_seq_len + 1,
+                kv_len + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            ke = ks + seq_lens_expanded
+            ks_list.append(ks)
+            ke_list.append(ke)
+
+            # bi: The index within the selected batch bs_idx. Entries that were not selected are ignored.
+            bi = i
+            tb = torch.full(
+                (extend_seq_len,), bi, dtype=torch.int32, device=self.device
+            )
+            token_to_batch_idx.append(tb)
+
+            if bs_idx is None or i in bs_idx:  # skip batch not included in bs_idx
+                q_offset += extend_seq_len
+                k_offset += seq_len
+
+        ks = torch.cat(ks_list, dim=0)
+        ke = torch.cat(ke_list, dim=0)
+        token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
+        return (ks, ke), token_to_batch_idx
+    
     def _init_dsa_metadata(self, forward_batch: ForwardBatch):
         from sglang.srt.layers.attention.dsa_backend import DSAMetadata
 
@@ -189,8 +261,15 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        assert forward_batch.seq_lens_cpu is not None
-        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+        if forward_batch.seq_lens_cpu is not None:
+            max_seqlen_k = int(
+                forward_batch.seq_lens_cpu.max().item() + draft_token_num
+            )
+        else:
+            # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
+            # batches; graph replay uses the static page-table width, so only this
+            # eager (e.g. over-capture-bs) fallback needs a length here.
+            max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
         # [b, max_seqlen_k]
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -251,6 +330,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
+        indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
+            forward_batch, bs_idx_cpu
+        )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         dsa_cache_seqlens_int32 = compute_dsa_seqlens(
             original_seq_lens=seqlens_expanded,
@@ -284,7 +366,14 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens_sum=forward_batch.seq_lens_sum,
             page_table_1=page_table,
             page_table_1_flattened=None,
-            flashmla_metadata=None, # FlashMLA is not supported
+            flashmla_metadata=(
+                self._compute_flashmla_metadata(
+                    cache_seqlens=dsa_cache_seqlens_int32,
+                    seq_len_q=1,
+                )
+                if False
+                else None
+            ),
             paged_mqa_schedule_metadata=None,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
@@ -294,10 +383,10 @@ class IntelAMXAttnBackend(AttentionBackend):
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=None,
-            indexer_k_start_end=None,
+            indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
-            token_to_batch_idx=None,
+            token_to_batch_idx=token_to_batch_idx,
         )
 
     def _init_flashmla_cpu_indices(

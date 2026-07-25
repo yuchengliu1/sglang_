@@ -1220,6 +1220,80 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         return topk_result
 
+    def _get_topk_ragged_cpu(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        topk_result: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if TYPE_CHECKING:
+            assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
+
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+
+        page_size = get_token_to_kv_pool().page_size
+        assert page_size == 64, "CPU DSA indexer only supports page size 64"
+
+        assert len(weights.shape) == 3
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+        weights = weights.squeeze(-1)
+
+        block_tables = metadata.get_page_table_64()
+
+        batch_size = len(block_tables)
+        token_nums, _, _ = q_fp8.shape
+        device = q_fp8.device
+
+        if topk_result is None:
+            topk_result = torch.full(
+                (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+            )
+        if batch_size == 0:
+            return topk_result
+
+        ks, ke = metadata.get_indexer_kvcache_range()
+
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+            layer_id,
+            metadata.get_indexer_seq_len(),
+            block_tables,
+            seq_len_sum,
+            max_seq_len,
+        )
+        k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+        k_scale = k_scale.view(torch.float32).squeeze(-1)
+
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        q_offset = ks.shape[0]
+        k_offset = k_fp8.shape[0]
+
+        assert q_fp8[:q_offset].shape[0] != 0
+        logits = torch.ops.sgl_kernel.fp8_mqa_logits_cpu(
+            q_fp8[:q_offset],
+            k_fp8,
+            k_scale,
+            weights[:q_offset],
+            ks,
+            ke,
+            False,
+        )
+        assert logits.shape[0] == len(seq_lens_expanded)
+        assert logits.shape[1] == k_offset
+
+        self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
+        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+        topk_result[:q_offset] = raw_topk_result
+        return topk_result
+
     def _forward_cuda_k_only(
         self,
         x: torch.Tensor,
@@ -2060,53 +2134,93 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
-        query, key, weights_raw = self._get_q_k_bf16(
-            q_lora, x, positions, False, forward_batch=forward_batch
+        # When weights_proj is LoRA-wrapped, use an eager module call so the
+        # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
+        # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
+        # absent then; short-circuit before touching it.
+        weights_proj_lora = not self.use_dsa_indexer_fusion and getattr(
+            self.weights_proj, "set_lora", False
         )
-        q_fp8, q_scale = act_quant_cpu(query, self.block_size, self.scale_fmt)
-        self._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key,
-            act_quant=act_quant_cpu,
-        )
-        if isinstance(x, tuple):
-            assert len(x) in (
-                2,
-                3,
-            ), "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
-            x_q, x_s = x[0], x[1]
-            if (
-                x_s is not None
-                and x_q.dim() == 2
-                and x_s.dim() == 2
-                and x_q.shape[0] == x_s.shape[0]
-            ):
-                m, n = x_q.shape
-                ng = x_s.shape[1]
-                if ng > 0 and n % ng == 0:
-                    group = n // ng
-                    x_for_gate = (
-                        x_q.to(torch.float32)
-                        .view(m, ng, group)
-                        .mul_(x_s.to(torch.float32).unsqueeze(-1))
-                        .view(m, n)
-                        .to(torch.bfloat16)
-                    )
+        if forward_batch.forward_mode.is_decode_or_idle():
+            if not self.use_dsa_indexer_fusion:
+                weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
+            query, key, weights_raw = self._get_q_k_bf16(
+                q_lora, x, positions, False, forward_batch=forward_batch
+            )
+            q_fp8, q_scale = act_quant_cpu(query, self.block_size, self.scale_fmt)
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant_cpu,
+            )
+            if self.use_dsa_indexer_fusion:
+                weights = self._scale_head_gates(weights_raw, q_scale)
+            else:
+                weights = weights.unsqueeze(-1) * (q_scale * self.softmax_scale)
+        else:
+            query, key, weights_raw = self._get_q_k_bf16(
+                q_lora, x, positions, False, forward_batch=forward_batch
+            )
+            q_fp8, q_scale = act_quant_cpu(query, self.block_size, self.scale_fmt)
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant_cpu,
+            )
+            if isinstance(x, tuple):
+                assert len(x) in (
+                    2,
+                    3,
+                ), "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+                x_q, x_s = x[0], x[1]
+                if (
+                    x_s is not None
+                    and x_q.dim() == 2
+                    and x_s.dim() == 2
+                    and x_q.shape[0] == x_s.shape[0]
+                ):
+                    m, n = x_q.shape
+                    ng = x_s.shape[1]
+                    if ng > 0 and n % ng == 0:
+                        group = n // ng
+                        x_for_gate = (
+                            x_q.to(torch.float32)
+                            .view(m, ng, group)
+                            .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                            .view(m, n)
+                            .to(torch.bfloat16)
+                        )
+                    else:
+                        x_for_gate = x_q.to(torch.bfloat16)
                 else:
                     x_for_gate = x_q.to(torch.bfloat16)
             else:
-                x_for_gate = x_q.to(torch.bfloat16)
-        else:
-            x_for_gate = x
-        weights = self._get_logits_head_gate(x_for_gate, q_scale)
-
-        topk_result = self.forward_indexer(
-                q_fp8.contiguous(),
-                weights,
-                forward_batch,
-                topk=self.index_topk,
-                layer_id=layer_id,
+                x_for_gate = x
+            weights = self._get_logits_head_gate(x_for_gate, q_scale)
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            topk_result = self._get_topk_paged(
+                forward_batch, layer_id, q_fp8, weights, metadata
             )
+        else:
+            topk_result = self._get_topk_ragged_cpu(
+                forward_batch,
+                layer_id,
+                q_fp8,
+                weights,
+                metadata,
+            )
+        # topk_result = self.forward_indexer(
+        #         q_fp8.contiguous(),
+        #         weights,
+        #         forward_batch,
+        #         topk=self.index_topk,
+        #         layer_id=layer_id,
+        #     )
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
