@@ -6,6 +6,15 @@
 #include "common.h"
 #include "vec.h"
 
+// Fused GEMM + relu + per-head weighted reduction, defined in gemm.cpp.
+extern void fused_linear_relu_reduce(
+    at::Tensor& out,
+    at::Tensor& q,
+    at::Tensor& q_scale,
+    at::Tensor& k,
+    at::Tensor& k_scale,
+    bool is_vnni);
+
 namespace {
 
 constexpr int64_t kBlockSize = 64;
@@ -13,52 +22,73 @@ constexpr int64_t kHeadDim = 128;
 constexpr int64_t kHeadDimWithScaleBytes = 132;
 constexpr int64_t kScaleOffsetBytes = kBlockSize * kHeadDim;
 constexpr int64_t kBlockBytes = kBlockSize * kHeadDimWithScaleBytes;
+// AMX weight-packing granularity required by convert_weight_packed (TILE_N in gemm.h).
+constexpr int64_t kTileN = 16;
 
-inline float fp8_e4m3_to_float(uint8_t v) {
-  c10::Float8_e4m3fn x;
-  x.x = v;
-  return static_cast<float>(x);
-}
-
-inline float dot_fp8_128_scalar(const uint8_t* k, const uint8_t* q) {
-  float dot = 0.0f;
-  for (int64_t d = 0; d < kHeadDim; ++d) {
-    dot += fp8_e4m3_to_float(k[d]) * fp8_e4m3_to_float(q[d]);
-  }
-  return dot;
-}
-
+// Efficient fp8_e4m3fn -> bf16 conversion using CVT_FP8_TO_BF16 from vec.h.
+// Processes 32 elements per AVX512 iteration (256-bit load, 512-bit store).
+void fp8_to_bf16(at::BFloat16* __restrict__ dst, const uint8_t* __restrict__ src, int64_t n) {
 #if defined(CPU_CAPABILITY_AVX512)
-inline float dot_fp8_128(const uint8_t* k, const uint8_t* q) {
-  __m512 acc = _mm512_setzero_ps();
-  for (int64_t d = 0; d < kHeadDim; d += 32) {
-    const __m256i k8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k + d));
-    const __m256i q8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d));
-    acc = _mm512_dpbf16_ps(acc, CVT_FP8_TO_BF16(k8), CVT_FP8_TO_BF16(q8));
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m512bh v = CVT_FP8_TO_BF16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)v);
   }
-  return _mm512_reduce_add_ps(acc);
-}
+  for (; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
 #else
-inline float dot_fp8_128(const uint8_t* k, const uint8_t* q) {
-  return dot_fp8_128_scalar(k, q);
-}
+  for (int64_t i = 0; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
 #endif
+}
 
 template <typename T>
 inline int64_t load_int(const T* ptr, int64_t idx) {
   return static_cast<int64_t>(ptr[idx]);
 }
 
-template <typename T>
-inline float load_weight(const T* ptr, int64_t idx) {
-  return static_cast<float>(ptr[idx]);
+// Gather one batch row's paged K (fp8 -> bf16) and per-token k_scale into
+// contiguous buffers, padded up to a multiple of kTileN so the AMX
+// weight-packing path in fused_linear_relu_reduce is always usable. The
+// padding rows are packed but never read since fused_linear_relu_reduce
+// only produces k_scale.size(0) == seq_len output columns.
+template <typename page_t>
+void gather_row_kv(
+    const uint8_t* __restrict__ cache_ptr,
+    const page_t* __restrict__ page_row,
+    int64_t pages_per_batch,
+    int64_t num_blocks,
+    int64_t seq_len,
+    at::BFloat16* __restrict__ k_bf16_row,
+    float* __restrict__ k_scale_row) {
+  for (int64_t token = 0; token < seq_len; ++token) {
+    const int64_t logical_page = token / kBlockSize;
+    const int64_t token_in_page = token % kBlockSize;
+    TORCH_CHECK(logical_page < pages_per_batch, "page_table does not cover seq_len");
+
+    const int64_t physical_page = load_int(page_row, logical_page);
+    TORCH_CHECK(physical_page >= 0 && physical_page < num_blocks, "page_table contains an invalid page index");
+
+    const uint8_t* block = cache_ptr + physical_page * kBlockBytes;
+    const uint8_t* k_token = block + token_in_page * kHeadDim;
+    const float* scale_ptr = reinterpret_cast<const float*>(block + kScaleOffsetBytes);
+
+    fp8_to_bf16(k_bf16_row + token * kHeadDim, k_token, kHeadDim);
+    k_scale_row[token] = scale_ptr[token_in_page];
+  }
 }
 
-template <typename seq_t, typename page_t, typename weight_t>
+template <typename seq_t, typename page_t>
 void fp8_paged_mqa_logits_cpu_impl(
     const at::Tensor& q_fp8,
     const at::Tensor& kvcache_fp8,
-    const at::Tensor& weight,
+    const at::Tensor& weight_f32,
     const at::Tensor& seq_lens,
     const at::Tensor& page_table,
     at::Tensor& logits,
@@ -70,84 +100,68 @@ void fp8_paged_mqa_logits_cpu_impl(
 
   const auto* q_ptr = reinterpret_cast<const uint8_t*>(q_fp8.const_data_ptr());
   const auto* cache_ptr = reinterpret_cast<const uint8_t*>(kvcache_fp8.const_data_ptr());
-  const auto* weight_ptr = weight.const_data_ptr<weight_t>();
   const auto* seq_ptr = seq_lens.const_data_ptr<seq_t>();
   const auto* page_ptr = page_table.const_data_ptr<page_t>();
-  auto* out_ptr = logits.data_ptr<float>();
 
-  at::parallel_for(0, batch_size * max_seq_len, GRAIN_SIZE / kHeadDim, [&](int64_t begin, int64_t end) {
-    int64_t b{0}, token{0};
-    data_index_init(begin, b, batch_size, token, max_seq_len);
-    for (int64_t i = begin; i < end; ++i) {
+  const auto bf16_opts = q_fp8.options().dtype(at::kBFloat16);
+  const auto f32_opts = weight_f32.options();
+
+  // Parallelize across batch rows; each row does its own paged-cache gather
+  // + a tiny GEMM (M=1) via fused_linear_relu_reduce instead of a scalar
+  // per-token dot-product loop.
+  at::parallel_for(0, batch_size, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t b = begin; b < end; ++b) {
       const int64_t seq_len = load_int(seq_ptr, b);
       TORCH_CHECK(seq_len >= 0 && seq_len <= max_seq_len, "seq_lens must be in [0, max_seq_len]");
-
-      if (token >= seq_len) {
-        data_index_step(b, batch_size, token, max_seq_len);
+      if (seq_len == 0) {
         continue;
       }
 
-      const int64_t q_batch_offset = ((b * 1 * num_heads) * kHeadDim);
-      const int64_t weight_batch_offset = b * num_heads;
-      const int64_t page_batch_offset = b * pages_per_batch;
-      float* out_row = out_ptr + b * max_seq_len;
+      const int64_t seq_len_pad = ((seq_len + kTileN - 1) / kTileN) * kTileN;
 
-      const int64_t logical_page = token / kBlockSize;
-      const int64_t token_in_page = token % kBlockSize;
-      TORCH_CHECK(logical_page < pages_per_batch, "page_table does not cover seq_len");
-
-      const int64_t physical_page = load_int(page_ptr, page_batch_offset + logical_page);
-      TORCH_CHECK(physical_page >= 0 && physical_page < num_blocks, "page_table contains an invalid page index");
-
-      const uint8_t* block = cache_ptr + physical_page * kBlockBytes;
-      const uint8_t* k_token = block + token_in_page * kHeadDim;
-      const float* scale_ptr = reinterpret_cast<const float*>(block + kScaleOffsetBytes);
-      const float k_scale = scale_ptr[token_in_page];
-
-      float score_sum = 0.0f;
-      for (int64_t h = 0; h < num_heads; ++h) {
-        const uint8_t* q_head = q_ptr + q_batch_offset + h * kHeadDim;
-        float dot = dot_fp8_128(k_token, q_head);
-        dot = std::max(dot, 0.0f);
-        score_sum += dot * load_weight(weight_ptr, weight_batch_offset + h);
+      at::Tensor k_bf16;
+      if (seq_len_pad == seq_len) {
+        k_bf16 = at::empty({seq_len, kHeadDim}, bf16_opts);
+      } else {
+        k_bf16 = at::zeros({seq_len_pad, kHeadDim}, bf16_opts);
       }
+      auto k_scale = at::empty({seq_len}, f32_opts);
 
-      out_row[token] = score_sum * k_scale;
+      gather_row_kv<page_t>(
+          cache_ptr,
+          page_ptr + b * pages_per_batch,
+          pages_per_batch,
+          num_blocks,
+          seq_len,
+          k_bf16.data_ptr<at::BFloat16>(),
+          k_scale.data_ptr<float>());
 
-      data_index_step(b, batch_size, token, max_seq_len);
+      auto q_bf16 = at::empty({1, num_heads, kHeadDim}, bf16_opts);
+      fp8_to_bf16(q_bf16.data_ptr<at::BFloat16>(), q_ptr + b * num_heads * kHeadDim, num_heads * kHeadDim);
+
+      at::Tensor q_scale_row = weight_f32.select(0, b).unsqueeze(0).contiguous();  // [1, num_heads]
+      auto out_row = at::empty({1, seq_len}, f32_opts);
+
+      fused_linear_relu_reduce(out_row, q_bf16, q_scale_row, k_bf16, k_scale, /*is_vnni=*/false);
+
+      logits.narrow(0, b, 1).narrow(1, 0, seq_len).copy_(out_row);
     }
   });
-}
-
-template <typename seq_t, typename page_t>
-void dispatch_weight_type(
-    const at::Tensor& q_fp8,
-    const at::Tensor& kvcache_fp8,
-    const at::Tensor& weight,
-    const at::Tensor& seq_lens,
-    const at::Tensor& page_table,
-    at::Tensor& logits,
-    int64_t max_seq_len) {
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, weight.scalar_type(), "fp8_paged_mqa_logits_cpu_weight", [&] {
-        fp8_paged_mqa_logits_cpu_impl<seq_t, page_t, scalar_t>(
-            q_fp8, kvcache_fp8, weight, seq_lens, page_table, logits, max_seq_len);
-      });
 }
 
 template <typename seq_t>
 void dispatch_page_type(
     const at::Tensor& q_fp8,
     const at::Tensor& kvcache_fp8,
-    const at::Tensor& weight,
+    const at::Tensor& weight_f32,
     const at::Tensor& seq_lens,
     const at::Tensor& page_table,
     at::Tensor& logits,
     int64_t max_seq_len) {
   if (page_table.scalar_type() == at::kInt) {
-    dispatch_weight_type<seq_t, int32_t>(q_fp8, kvcache_fp8, weight, seq_lens, page_table, logits, max_seq_len);
+    fp8_paged_mqa_logits_cpu_impl<seq_t, int32_t>(q_fp8, kvcache_fp8, weight_f32, seq_lens, page_table, logits, max_seq_len);
   } else if (page_table.scalar_type() == at::kLong) {
-    dispatch_weight_type<seq_t, int64_t>(q_fp8, kvcache_fp8, weight, seq_lens, page_table, logits, max_seq_len);
+    fp8_paged_mqa_logits_cpu_impl<seq_t, int64_t>(q_fp8, kvcache_fp8, weight_f32, seq_lens, page_table, logits, max_seq_len);
   } else {
     TORCH_CHECK(false, "page_table must be int32 or int64");
   }
@@ -188,12 +202,17 @@ at::Tensor fp8_paged_mqa_logits_cpu(
   TORCH_CHECK(page_table.dim() == 2 && page_table.size(0) == batch_size, "page_table must have shape [batch, pages]");
   TORCH_CHECK(max_seq_len >= 0, "max_seq_len must be non-negative");
 
+  // fused_linear_relu_reduce requires fp32 q_scale/weight; upcast once for
+  // the whole batch (CPU forward always produces fp32 weights already, so
+  // this is normally a no-op aside from the dtype check).
+  at::Tensor weight_f32 = weight.scalar_type() == at::kFloat ? weight : weight.to(at::kFloat);
+
   auto logits = at::empty({batch_size, max_seq_len}, q_fp8.options().dtype(at::kFloat));
 
   if (seq_lens.scalar_type() == at::kInt) {
-    dispatch_page_type<int32_t>(q_fp8, kvcache_fp8, weight, seq_lens, page_table, logits, max_seq_len);
+    dispatch_page_type<int32_t>(q_fp8, kvcache_fp8, weight_f32, seq_lens, page_table, logits, max_seq_len);
   } else if (seq_lens.scalar_type() == at::kLong) {
-    dispatch_page_type<int64_t>(q_fp8, kvcache_fp8, weight, seq_lens, page_table, logits, max_seq_len);
+    dispatch_page_type<int64_t>(q_fp8, kvcache_fp8, weight_f32, seq_lens, page_table, logits, max_seq_len);
   } else {
     TORCH_CHECK(false, "seq_lens must be int32 or int64");
   }

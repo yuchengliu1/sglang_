@@ -890,7 +890,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        if _is_cpu:
+            logits = torch.ops.sgl_kernel.fp8_paged_mqa_logits_cpu(
+                q_fp8.unsqueeze(1),
+                kv_cache_fp8,
+                weights,
+                seqlens_32,
+                block_tables,
+                max_seq_len,
+                False,
+            )
+        elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1248,11 +1258,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         batch_size = len(block_tables)
         token_nums, _, _ = q_fp8.shape
-        device = q_fp8.device
 
         if topk_result is None:
             topk_result = torch.full(
-                (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+                (token_nums, self.index_topk), -1, device="cpu", dtype=torch.int32
             )
         if batch_size == 0:
             return topk_result

@@ -2,123 +2,90 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 #include "common.h"
 #include "vec.h"
-
-namespace {
-
-constexpr int64_t kHeadDim = 128;
-
-inline float fp8_e4m3_to_float(uint8_t v) {
-  c10::Float8_e4m3fn x;
-  x.x = v;
-  return static_cast<float>(x);
-}
-
-inline float dot_fp8_128_scalar(const uint8_t* q, const uint8_t* k) {
-  float dot = 0.0f;
-  for (int64_t d = 0; d < kHeadDim; ++d) {
-    dot += fp8_e4m3_to_float(q[d]) * fp8_e4m3_to_float(k[d]);
-  }
-  return dot;
-}
-
-#if defined(CPU_CAPABILITY_AVX512)
-inline float dot_fp8_128(const uint8_t* q, const uint8_t* k) {
-  __m512 acc = _mm512_setzero_ps();
-  for (int64_t d = 0; d < kHeadDim; d += 32) {
-    const __m256i q8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d));
-    const __m256i k8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k + d));
-    acc = _mm512_dpbf16_ps(acc, CVT_FP8_TO_BF16(q8), CVT_FP8_TO_BF16(k8));
-  }
-  return _mm512_reduce_add_ps(acc);
-}
-#else
-inline float dot_fp8_128(const uint8_t* q, const uint8_t* k) {
-  return dot_fp8_128_scalar(q, k);
-}
-#endif
-
-template <typename T>
-inline int64_t load_int(const T* ptr, int64_t idx) {
-  return static_cast<int64_t>(ptr[idx]);
-}
-
-template <typename T>
-inline float load_weight(const T* ptr, int64_t idx) {
-  return static_cast<float>(ptr[idx]);
-}
 
 // Ragged (non-paged) fp8 MQA logits: q and k are both flat/concatenated across
 // all requests in the batch. Query token `i` may only attend to key tokens in
 // the half-open range [ks[i], ke[i)) of the shared k buffer (causal, and
 // scoped to its own request via the request-local offset baked into ks/ke).
-template <typename index_t, typename weight_t>
-void fp8_mqa_logits_cpu_impl(
-    const at::Tensor& q_fp8,
-    const at::Tensor& k_fp8,
-    const at::Tensor& k_scale,
-    const at::Tensor& weight,
-    const at::Tensor& ks,
-    const at::Tensor& ke,
-    at::Tensor& logits) {
-  const int64_t num_q = q_fp8.size(0);
-  const int64_t num_heads = q_fp8.size(1);
-  const int64_t num_k = k_fp8.size(0);
+//
+// This is a GEMM (Q @ K^T per head, relu, per-head weighted reduce, scale by
+// k_scale), so — like fp8_index.cpp / fp8_paged_mqa_logits_cpu — it is
+// computed via convert-to-bf16 + fused_linear_relu_reduce (the AMX/vector GEMM
+// kernel in gemm.cpp) instead of a scalar per-token dot-product loop.
+//
+// clean_logits=False (the common fast path): this computes a full dense
+// [num_q, num_k] matrix; the caller (topk_transform with ks=ks) is responsible
+// for only selecting within [ks[i], ke[i)) per row, so entries outside that
+// range may hold unmasked (but never read) values.
+//
+// clean_logits=True: entries outside [ks[i], ke[i)) are explicitly filled with
+// -inf after the GEMM, matching the CUDA/HIP deep_gemm/aiter semantics, for
+// callers that read the raw logits without going through topk_transform's
+// ks-aware masking.
 
-  const auto* q_ptr = reinterpret_cast<const uint8_t*>(q_fp8.const_data_ptr());
-  const auto* k_ptr = reinterpret_cast<const uint8_t*>(k_fp8.const_data_ptr());
-  const auto* k_scale_ptr = k_scale.const_data_ptr<float>();
-  const auto* weight_ptr = weight.const_data_ptr<weight_t>();
-  const auto* ks_ptr = ks.const_data_ptr<index_t>();
-  const auto* ke_ptr = ke.const_data_ptr<index_t>();
-  auto* out_ptr = logits.data_ptr<float>();
+namespace {
 
-  const int64_t grain_size = std::max<int64_t>(GRAIN_SIZE / std::max<int64_t>(num_heads, 1), 1);
-  at::parallel_for(0, num_q, grain_size, [&](int64_t begin, int64_t end) {
+constexpr int64_t kHeadDim = 128;
+// AMX weight-packing granularity required by convert_weight_packed (TILE_N in gemm.h).
+constexpr int64_t kTileN = 16;
+
+// Efficient fp8_e4m3fn -> bf16 conversion using CVT_FP8_TO_BF16 from vec.h.
+// Processes 32 elements per AVX512 iteration (256-bit load, 512-bit store).
+void fp8_to_bf16(at::BFloat16* __restrict__ dst, const uint8_t* __restrict__ src, int64_t n) {
+#if defined(CPU_CAPABILITY_AVX512)
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m512bh v = CVT_FP8_TO_BF16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)v);
+  }
+  for (; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
+#else
+  for (int64_t i = 0; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
+#endif
+}
+
+// Fill entries outside [ks[i], ke[i)) with -inf for every row i, in place.
+void clean_logits_range(at::Tensor& logits, const at::Tensor& ks, const at::Tensor& ke) {
+  const int64_t num_q = logits.size(0);
+  const int64_t num_k = logits.size(1);
+  float* __restrict__ logits_ptr = logits.data_ptr<float>();
+  const int32_t* __restrict__ ks_ptr = ks.const_data_ptr<int32_t>();
+  const int32_t* __restrict__ ke_ptr = ke.const_data_ptr<int32_t>();
+  constexpr float neg_inf = -std::numeric_limits<float>::infinity();
+
+  at::parallel_for(0, num_q, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
-      const int64_t k_start = load_int(ks_ptr, i);
-      const int64_t k_end = load_int(ke_ptr, i);
-      TORCH_CHECK(
-          k_start >= 0 && k_end <= num_k && k_start <= k_end,
-          "ks/ke out of range in fp8_mqa_logits_cpu");
-
-      const uint8_t* q_row_base = q_ptr + i * num_heads * kHeadDim;
-      const weight_t* w_row = weight_ptr + i * num_heads;
-      float* out_row = out_ptr + i * num_k;
-
-      for (int64_t k = k_start; k < k_end; ++k) {
-        const uint8_t* k_row = k_ptr + k * kHeadDim;
-        float score_sum = 0.0f;
-        for (int64_t h = 0; h < num_heads; ++h) {
-          const uint8_t* q_head = q_row_base + h * kHeadDim;
-          float dot = dot_fp8_128(q_head, k_row);
-          dot = std::max(dot, 0.0f);
-          score_sum += dot * load_weight(w_row, h);
-        }
-        out_row[k] = score_sum * k_scale_ptr[k];
-      }
+      float* __restrict__ row = logits_ptr + i * num_k;
+      const int64_t k_start = std::clamp<int64_t>(ks_ptr[i], 0, num_k);
+      const int64_t k_end = std::clamp<int64_t>(ke_ptr[i], 0, num_k);
+      std::fill(row, row + k_start, neg_inf);
+      std::fill(row + std::max(k_start, k_end), row + num_k, neg_inf);
     }
   });
 }
 
-template <typename index_t>
-void dispatch_weight_type(
-    const at::Tensor& q_fp8,
-    const at::Tensor& k_fp8,
-    const at::Tensor& k_scale,
-    const at::Tensor& weight,
-    const at::Tensor& ks,
-    const at::Tensor& ke,
-    at::Tensor& logits) {
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, weight.scalar_type(), "fp8_mqa_logits_cpu_weight", [&] {
-        fp8_mqa_logits_cpu_impl<index_t, scalar_t>(q_fp8, k_fp8, k_scale, weight, ks, ke, logits);
-      });
-}
-
 }  // namespace
+
+// Fused GEMM + relu + per-head weighted reduction, defined in gemm.cpp.
+extern void fused_linear_relu_reduce(
+    at::Tensor& out,
+    at::Tensor& q,
+    at::Tensor& q_scale,
+    at::Tensor& k,
+    at::Tensor& k_scale,
+    bool is_vnni);
 
 at::Tensor fp8_mqa_logits_cpu(
     at::Tensor& q_fp8,
@@ -128,7 +95,6 @@ at::Tensor fp8_mqa_logits_cpu(
     at::Tensor& ks,
     at::Tensor& ke,
     bool clean_logits) {
-  TORCH_CHECK(!clean_logits, "fp8_mqa_logits_cpu only supports clean_logits == false");
   CHECK_INPUT(q_fp8);
   CHECK_INPUT(k_fp8);
   CHECK_INPUT(k_scale);
@@ -138,6 +104,7 @@ at::Tensor fp8_mqa_logits_cpu(
   TORCH_CHECK(q_fp8.scalar_type() == at::ScalarType::Float8_e4m3fn, "q_fp8 must be torch.float8_e4m3fn");
   TORCH_CHECK(k_fp8.scalar_type() == at::ScalarType::Float8_e4m3fn, "k_fp8 must be torch.float8_e4m3fn");
   TORCH_CHECK(k_scale.scalar_type() == at::kFloat, "k_scale must be torch.float32");
+  TORCH_CHECK(weight.scalar_type() == at::kFloat, "weight must be torch.float32");
 
   TORCH_CHECK(q_fp8.dim() == 3, "q_fp8 must have shape [num_q_tokens, num_heads, head_dim]");
   TORCH_CHECK(q_fp8.size(2) == kHeadDim, "q_fp8 head_dim must be 128");
@@ -153,23 +120,40 @@ at::Tensor fp8_mqa_logits_cpu(
       "weight must have shape [num_q_tokens, num_heads]");
   TORCH_CHECK(ks.dim() == 1 && ks.size(0) == num_q, "ks must have shape [num_q_tokens]");
   TORCH_CHECK(ke.sizes() == ks.sizes(), "ke must have the same shape as ks");
+  TORCH_CHECK(ks.scalar_type() == at::kInt, "ks must be torch.int32");
+  TORCH_CHECK(ke.scalar_type() == at::kInt, "ke must be torch.int32");
 
-  // Zero-init so any (masked-out) region outside [ks[i], ke[i)) is
-  // deterministic rather than reading uninitialized heap memory; downstream
-  // topk_transform only trusts the [ks[i], ke[i)) slice of each row anyway.
-  auto logits = at::zeros({num_q, num_k}, k_scale.options().dtype(at::kFloat));
+  auto logits = at::empty({num_q, num_k}, weight.options().dtype(at::kFloat));
   if (num_q == 0 || num_k == 0) {
     return logits;
   }
 
-  if (ks.scalar_type() == at::kInt) {
-    TORCH_CHECK(ke.scalar_type() == at::kInt, "ks and ke must have the same dtype");
-    dispatch_weight_type<int32_t>(q_fp8, k_fp8, k_scale, weight, ks, ke, logits);
-  } else if (ks.scalar_type() == at::kLong) {
-    TORCH_CHECK(ke.scalar_type() == at::kLong, "ks and ke must have the same dtype");
-    dispatch_weight_type<int64_t>(q_fp8, k_fp8, k_scale, weight, ks, ke, logits);
+  // AMX weight packing (inside fused_linear_relu_reduce) requires the K row
+  // count to be a multiple of kTileN; pad with zero rows when needed. The
+  // padding rows are never read since fused_linear_relu_reduce only produces
+  // k_scale.size(0) == num_k output columns.
+  const int64_t num_k_pad = ((num_k + kTileN - 1) / kTileN) * kTileN;
+  const auto bf16_opts = q_fp8.options().dtype(at::kBFloat16);
+
+  auto q_bf16 = at::empty({num_q, num_heads, kHeadDim}, bf16_opts);
+  fp8_to_bf16(
+      q_bf16.data_ptr<at::BFloat16>(),
+      reinterpret_cast<const uint8_t*>(q_fp8.const_data_ptr()),
+      num_q * num_heads * kHeadDim);
+
+  at::Tensor k_bf16;
+  if (num_k_pad == num_k) {
+    k_bf16 = at::empty({num_k, kHeadDim}, bf16_opts);
   } else {
-    TORCH_CHECK(false, "ks/ke must be int32 or int64");
+    k_bf16 = at::zeros({num_k_pad, kHeadDim}, bf16_opts);
+  }
+  fp8_to_bf16(
+      k_bf16.data_ptr<at::BFloat16>(), reinterpret_cast<const uint8_t*>(k_fp8.const_data_ptr()), num_k * kHeadDim);
+
+  fused_linear_relu_reduce(logits, q_bf16, weight, k_bf16, k_scale, /*is_vnni=*/false);
+
+  if (clean_logits) {
+    clean_logits_range(logits, ks, ke);
   }
 
   return logits;
