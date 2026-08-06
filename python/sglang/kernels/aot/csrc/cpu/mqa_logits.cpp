@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 
 #include "common.h"
 #include "vec.h"
@@ -13,19 +12,17 @@
 // scoped to its own request via the request-local offset baked into ks/ke).
 //
 // This is a GEMM (Q @ K^T per head, relu, per-head weighted reduce, scale by
-// k_scale), so — like fp8_index.cpp / fp8_paged_mqa_logits_cpu — it is
-// computed via convert-to-bf16 + fused_linear_relu_reduce (the AMX/vector GEMM
-// kernel in gemm.cpp) instead of a scalar per-token dot-product loop.
+// k_scale), computed via convert-to-bf16 + mqa_logits_gemm_kv_range (gemm.cpp)
+// - a standalone AMX/vector GEMM kernel (no relation to fused_linear_relu_reduce,
+// used by fp8_index.cpp / fp8_paged_mqa_logits_cpu) that skips whole KV tiles
+// outside a query row-tile's own [ks, ke) bounding box, with row-tiles aligned
+// to cu_seqlens_q request boundaries so a tile can never straddle two
+// requests' disjoint k-ranges (ports/extends DeepGEMM's block-bounding-box
+// pruning, which only aligns to its tiny BLOCK_Q and tolerates that pollution).
 //
-// clean_logits=False (the common fast path): this computes a full dense
-// [num_q, num_k] matrix; the caller (topk_transform with ks=ks) is responsible
-// for only selecting within [ks[i], ke[i)) per row, so entries outside that
-// range may hold unmasked (but never read) values.
-//
-// clean_logits=True: entries outside [ks[i], ke[i)) are explicitly filled with
-// -inf after the GEMM, matching the CUDA/HIP deep_gemm/aiter semantics, for
-// callers that read the raw logits without going through topk_transform's
-// ks-aware masking.
+// clean_logits=False (the only supported mode): entries outside each row's own
+// [ks[i], ke[i)) are left uninitialized; the caller (topk_transform with
+// ks=ks) is responsible for only selecting within that range per row.
 
 namespace {
 
@@ -56,35 +53,20 @@ void fp8_to_bf16(at::BFloat16* __restrict__ dst, const uint8_t* __restrict__ src
 #endif
 }
 
-// Fill entries outside [ks[i], ke[i)) with -inf for every row i, in place.
-void clean_logits_range(at::Tensor& logits, const at::Tensor& ks, const at::Tensor& ke) {
-  const int64_t num_q = logits.size(0);
-  const int64_t num_k = logits.size(1);
-  float* __restrict__ logits_ptr = logits.data_ptr<float>();
-  const int32_t* __restrict__ ks_ptr = ks.const_data_ptr<int32_t>();
-  const int32_t* __restrict__ ke_ptr = ke.const_data_ptr<int32_t>();
-  constexpr float neg_inf = -std::numeric_limits<float>::infinity();
-
-  at::parallel_for(0, num_q, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t i = begin; i < end; ++i) {
-      float* __restrict__ row = logits_ptr + i * num_k;
-      const int64_t k_start = std::clamp<int64_t>(ks_ptr[i], 0, num_k);
-      const int64_t k_end = std::clamp<int64_t>(ke_ptr[i], 0, num_k);
-      std::fill(row, row + k_start, neg_inf);
-      std::fill(row + std::max(k_start, k_end), row + num_k, neg_inf);
-    }
-  });
-}
-
 }  // namespace
 
-// Fused GEMM + relu + per-head weighted reduction, defined in gemm.cpp.
-extern void fused_linear_relu_reduce(
+// Request-boundary-aligned KV-range-pruned GEMM + relu + per-head weighted
+// reduction, defined in gemm.cpp. Standalone - does not share code with
+// fused_linear_relu_reduce.
+extern void mqa_logits_gemm_kv_range(
     at::Tensor& out,
     at::Tensor& q,
     at::Tensor& q_scale,
     at::Tensor& k,
     at::Tensor& k_scale,
+    at::Tensor& ks,
+    at::Tensor& ke,
+    at::Tensor& cu_seqlens_q,
     bool is_vnni);
 
 at::Tensor fp8_mqa_logits_cpu(
@@ -94,7 +76,11 @@ at::Tensor fp8_mqa_logits_cpu(
     at::Tensor& weight,
     at::Tensor& ks,
     at::Tensor& ke,
-    bool clean_logits) {
+    at::Tensor& cu_seqlens_q,
+    bool clean_logits,
+    int64_t max_seqlen_k) {
+  // max_seqlen_k: reserved for API parity with the CUDA path, not used yet.
+  TORCH_CHECK(!clean_logits, "fp8_mqa_logits_cpu only supports clean_logits == false");
   CHECK_INPUT(q_fp8);
   CHECK_INPUT(k_fp8);
   CHECK_INPUT(k_scale);
@@ -122,6 +108,9 @@ at::Tensor fp8_mqa_logits_cpu(
   TORCH_CHECK(ke.sizes() == ks.sizes(), "ke must have the same shape as ks");
   TORCH_CHECK(ks.scalar_type() == at::kInt, "ks must be torch.int32");
   TORCH_CHECK(ke.scalar_type() == at::kInt, "ke must be torch.int32");
+  CHECK_INPUT(cu_seqlens_q);
+  TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.size(0) >= 1, "cu_seqlens_q must be 1-d and non-empty");
+  TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be torch.int32");
 
   auto logits = at::empty({num_q, num_k}, weight.options().dtype(at::kFloat));
   if (num_q == 0 || num_k == 0) {
@@ -150,11 +139,7 @@ at::Tensor fp8_mqa_logits_cpu(
   fp8_to_bf16(
       k_bf16.data_ptr<at::BFloat16>(), reinterpret_cast<const uint8_t*>(k_fp8.const_data_ptr()), num_k * kHeadDim);
 
-  fused_linear_relu_reduce(logits, q_bf16, weight, k_bf16, k_scale, /*is_vnni=*/false);
-
-  if (clean_logits) {
-    clean_logits_range(logits, ks, ke);
-  }
+  mqa_logits_gemm_kv_range(logits, q_bf16, weight, k_bf16, k_scale, ks, ke, cu_seqlens_q, /*is_vnni=*/false);
 
   return logits;
 }

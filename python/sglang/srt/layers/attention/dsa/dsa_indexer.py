@@ -1285,6 +1285,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
 
+        # Per-request row boundaries in the same (expanded) token domain as
+        # ks/ke, so the kernel can align its row-tiles to request boundaries
+        # instead of straddling two requests' disjoint k-ranges.
+        extend_lens_cpu = metadata.get_dsa_extend_len_cpu()
+        assert sum(extend_lens_cpu) == q_offset
+        cu_seqlens_q = torch.zeros(len(extend_lens_cpu) + 1, dtype=torch.int32)
+        cu_seqlens_q[1:] = torch.tensor(extend_lens_cpu, dtype=torch.int32).cumsum(0)
+
         assert q_fp8[:q_offset].shape[0] != 0
         logits = torch.ops.sgl_kernel.fp8_mqa_logits_cpu(
             q_fp8[:q_offset],
@@ -1293,6 +1301,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             weights[:q_offset],
             ks,
             ke,
+            cu_seqlens_q,
             False,
         )
         assert logits.shape[0] == len(seq_lens_expanded)
