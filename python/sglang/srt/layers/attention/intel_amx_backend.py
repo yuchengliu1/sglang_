@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -75,6 +76,16 @@ class IntelAMXAttnBackend(AttentionBackend):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
             assert isinstance(model_runner.page_size, int)
             self.real_page_size: int = model_runner.page_size
+            self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
+                model_runner.server_args.dsa_topk_backend
+            )
+            self.dsa_topk_indices_already_physical = (
+                envs.SGLANG_DSA_FUSE_TOPK.get()
+                and (
+                    self.dsa_topk_backend.is_sgl_kernel()
+                    or self.dsa_topk_backend.is_flashinfer()
+                )
+            )
 
     def _build_extend_metadata(self, forward_batch: ForwardBatch):
         """Resolve (seq_lens, extend_seq_lens, extend_start_loc, tree_mask) for
@@ -446,7 +457,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         return DSAIndexerMetadata(
             attn_metadata=self.dsa_metadata,
             topk_transform_method=self.dsa_topk_transform_method,
-            topk_backend=DSATopKBackend.TORCH,
+            topk_backend=self.dsa_topk_backend,
         )
 
     def get_cpu_graph_seq_len_fill_value(self):
@@ -572,19 +583,32 @@ class IntelAMXAttnBackend(AttentionBackend):
         page_table_1 = self.dsa_metadata.page_table_1
         index_topk = topk_indices.shape[-1]
 
+        # With SGLANG_DSA_FUSE_TOPK on a fusion-capable backend (sgl-kernel / flashinfer),
+        # the indexer's fused kernel already folds the raw-index -> page-table transform
+        # in, so topk_indices here are ALREADY page_size=1 physical slots; re-running the
+        # transform below would gather through the page table a second time (mirrors GPU's
+        # `_get_fused_topk_page_table` passthrough in dsa_backend.py).
         if s_q == 1:
-            indices_phys = transform_index_page_table_decode(
-                page_table=page_table_1,
-                topk_indices=topk_indices,
-                page_size=1,
+            indices_phys = (
+                topk_indices
+                if self.dsa_topk_indices_already_physical
+                else transform_index_page_table_decode(
+                    page_table=page_table_1,
+                    topk_indices=topk_indices,
+                    page_size=1,
+                )
             )
             indices = indices_phys.unsqueeze(1)  # [bs, 1, index_topk]
         else:
-            indices_phys = transform_index_page_table_prefill(
-                page_table=page_table_1,
-                topk_indices=topk_indices,
-                extend_lens_cpu=self.dsa_metadata.dsa_extend_seq_lens_list,
-                page_size=1,
+            indices_phys = (
+                topk_indices
+                if self.dsa_topk_indices_already_physical
+                else transform_index_page_table_prefill(
+                    page_table=page_table_1,
+                    topk_indices=topk_indices,
+                    extend_lens_cpu=self.dsa_metadata.dsa_extend_seq_lens_list,
+                    page_size=1,
+                )
             )
             start_locs = forward_batch.extend_start_loc.tolist()
             ext_lens = forward_batch.extend_seq_lens_cpu

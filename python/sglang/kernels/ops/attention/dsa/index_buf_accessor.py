@@ -37,6 +37,8 @@ s: scale, 1 item per token, fp32
 class GetK:
     @classmethod
     def execute(cls, *args, **kwargs):
+        if _is_cpu and _cpu_amx:
+            return cls.execute_cpu(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
     @classmethod
@@ -105,10 +107,24 @@ class GetK:
             index_head_dim=pool.index_head_dim,
         )
 
+    @classmethod
+    def execute_cpu(
+        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+    ):
+        # 1D-only: page_indices is a single sequence's page table (num_pages,).
+        assert (
+            page_indices.dim() == 1
+        ), f"GetK.execute_cpu only supports 1D page_indices, got shape {tuple(page_indices.shape)}"
+        return torch.ops.sgl_kernel.get_k_cpu(
+            buf, page_indices, seq_len, pool.page_size, pool.index_head_dim
+        )
+
 
 class GetS:
     @classmethod
     def execute(cls, *args, **kwargs):
+        if _is_cpu and _cpu_amx:
+            return cls.execute_cpu(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
     @classmethod
@@ -174,6 +190,20 @@ class GetS:
             index_head_dim=pool.index_head_dim,
         )
 
+    @classmethod
+    def execute_cpu(
+        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+    ):
+        # 1D-only: page_indices is a single sequence's page table (num_pages,).
+        assert (
+            page_indices.dim() == 1
+        ), f"GetS.execute_cpu only supports 1D page_indices, got shape {tuple(page_indices.shape)}"
+        # get_s_cpu hardcodes a 4-byte (single quant group) scale width.
+        assert pool.index_head_dim // pool.quant_block_size == 1
+        return torch.ops.sgl_kernel.get_s_cpu(
+            buf, page_indices, seq_len, pool.page_size, pool.index_head_dim
+        )
+
 
 class GetKAndS:
     @classmethod
@@ -182,6 +212,8 @@ class GetKAndS:
         # which only matches the layout produced when the rest of the indexer
         # is on the page_size=64 preshuffle path. Otherwise fall back to the
         # triton implementation (which works on the page_size=1 legacy layout).
+        if _is_cpu and _cpu_amx:
+            return cls.execute_cpu(*args, **kwargs)
         if _use_aiter_preshuffle:
             return cls.aiter(*args, **kwargs)
         return cls.triton(*args, **kwargs)
@@ -191,31 +223,23 @@ class GetKAndS:
         cls,
         pool: "DSATokenToKVPool",
         buf: torch.Tensor,
-        seq_len: int,
         page_indices: torch.Tensor,
+        seq_len_tensor: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ):
-        # 1D-only interface: `page_indices` is a single sequence's page table
-        # of shape (num_pages,), mirroring GetK.torch_fast / GetS.torch_fast.
-        # The batched 2D interface is intentionally not supported here.
-        assert (
-            page_indices.dim() == 1
-        ), f"GetKAndS.execute_cpu only supports 1D page_indices, got shape {tuple(page_indices.shape)}"
-
-        k_out = torch.ops.sgl_kernel.get_k_cpu(
+        # Batched (multi-sequence) fused K+S gather, mirroring the aiter/triton
+        # classmethods' 2D page_indices contract.
+        # get_k_and_s_cpu hardcodes a 4-byte (single quant group) scale width.
+        assert pool.index_head_dim // pool.quant_block_size == 1
+        return torch.ops.sgl_kernel.get_k_and_s_cpu(
             buf,
             page_indices,
-            seq_len,
+            seq_len_tensor,
+            seq_len_sum,
             pool.page_size,
             pool.index_head_dim,
         )
-        s_out = torch.ops.sgl_kernel.get_s_cpu(
-            buf,
-            page_indices,
-            seq_len,
-            pool.page_size,
-            pool.index_head_dim,
-        )
-        return k_out, s_out
 
     @classmethod
     def aiter(

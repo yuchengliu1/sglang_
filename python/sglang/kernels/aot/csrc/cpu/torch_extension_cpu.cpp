@@ -416,6 +416,26 @@ void topk_transform_512_cpu(
     int64_t page_size,
     const std::optional<at::Tensor>& out_raw_indices);
 
+// DSA/NSA indexer fused top-k (CPU counterpart of the CUDA sgl_kernel::fast_topk* ops)
+void fast_topk_cpu(
+    const at::Tensor& score,
+    at::Tensor& indices,
+    const at::Tensor& lengths,
+    const std::optional<at::Tensor>& row_starts_opt);
+void fast_topk_transform_fused_cpu(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    const std::optional<at::Tensor>& row_starts_opt);
+void fast_topk_transform_ragged_fused_cpu(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    const std::optional<at::Tensor>& row_starts_opt);
+
 at::Tensor fp8_paged_mqa_logits_cpu(
     at::Tensor& q_fp8,
     at::Tensor& kvcache_fp8,
@@ -565,6 +585,15 @@ at::Tensor get_s_cpu(
     at::Tensor& buf,
     at::Tensor& page_indices,
     int64_t seq_len,
+    int64_t page_size,
+    int64_t index_head_dim);
+
+// get_k_and_s (batched, multi-sequence)
+std::tuple<at::Tensor, at::Tensor> get_k_and_s_cpu(
+    at::Tensor& buf,
+    at::Tensor& page_indices,
+    at::Tensor& seq_lens,
+    int64_t seq_len_sum,
     int64_t page_size,
     int64_t index_head_dim);
 
@@ -1017,6 +1046,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int page_size, Tensor(a!)? out_raw_indices) -> ()");
   m.impl("topk_transform_512_cpu", torch::kCPU, &topk_transform_512_cpu);
 
+  // DSA/NSA indexer fused top-k: same op names/schemas as the CUDA build in
+  // common_extension.cc, so sgl_kernel.top_k.fast_topk_v2/fast_topk_transform_fused/
+  // fast_topk_transform_ragged_fused work unchanged on CPU tensors.
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kCPU, &fast_topk_cpu);
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kCPU, &fast_topk_transform_fused_cpu);
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+      "topk_indices_offset, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kCPU, &fast_topk_transform_ragged_fused_cpu);
+
   // DeepSeek V4 compressed attention FP8 paged MQA logits
   m.def(
       "fp8_paged_mqa_logits_cpu(Tensor q_fp8, Tensor kvcache_fp8, Tensor weight, Tensor seq_lens, "
@@ -1119,6 +1162,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "get_s_cpu(Tensor buf, Tensor page_indices, int seq_len, "
       "int page_size, int index_head_dim) -> Tensor");
   m.impl("get_s_cpu", torch::kCPU, &get_s_cpu);
+
+  // get_k_and_s (batched, multi-sequence)
+  m.def(
+      "get_k_and_s_cpu(Tensor buf, Tensor page_indices, Tensor seq_lens, "
+      "int seq_len_sum, int page_size, int index_head_dim) -> (Tensor, Tensor)");
+  m.impl("get_k_and_s_cpu", torch::kCPU, &get_k_and_s_cpu);
 
   // quant_to_nope_fp8_rope_bf16_pack
   m.def("quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");

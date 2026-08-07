@@ -88,17 +88,6 @@ class IndexKeyCache:
         max_seq_len: int,
     ):
         buf = self.get_buffer(layer_id)
-        if _is_cpu and _cpu_has_amx_support:
-            # CPU only supports the 1D single-sequence execute_cpu interface.
-            assert (
-                page_indices.shape[0] == 1
-            ), f"CPU DSA get_index_k_scale_buffer only supports batch_size == 1, got {page_indices.shape[0]}"
-            return index_buf_accessor.GetKAndS.execute_cpu(
-                self,
-                buf,
-                seq_len_sum,
-                page_indices[0],
-            )
         return index_buf_accessor.GetKAndS.execute(
             self.pool,
             buf,

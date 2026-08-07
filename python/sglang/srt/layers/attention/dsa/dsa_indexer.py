@@ -4,6 +4,7 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 from einops import rearrange
 
@@ -53,7 +54,9 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     cpu_has_amx_support,
+    get_available_gpu_memory,
     get_bool_env_var,
+    get_cpu_memory_capacity,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -208,6 +211,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
     _mqa_logits_budget_bytes: Dict[int, int] = {}
+    _CPU_MQA_LOGITS_BUDGET_KEY = -1
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
@@ -974,11 +978,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         free_mem_fraction = self._mqa_logits_free_mem_fraction()
+        if _is_cpu:
+            assert device_index == self._CPU_MQA_LOGITS_BUDGET_KEY
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
         if cached_budget is not None:
             return cached_budget
 
-        total_mem = torch.cuda.get_device_properties(device_index).total_memory
+        if _is_cpu:
+            # Per-NUMA-node capacity (each CPU TP rank is bound to one NUMA node),
+            # in place of torch.cuda.get_device_properties(...).total_memory.
+            # get_cpu_memory_capacity() returns None when per-rank capacity can't
+            # be determined (custom core-binding settings); fall back to whole-
+            # machine total memory in that case.
+            cpu_mem_capacity_mb = get_cpu_memory_capacity()
+            total_mem = (
+                int(cpu_mem_capacity_mb * (1 << 20))
+                if cpu_mem_capacity_mb is not None
+                else int(psutil.virtual_memory().total)
+            )
+        else:
+            total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
         mem_fraction_static = get_schedule().mem_fraction_static
@@ -994,14 +1013,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Keep the static serving-memory guard during CUDA graph capture without
         # caching it. The first non-capture prefill path will cache the real
-        # free-memory budget below.
+        # free-memory budget below. CPU never enters capture mode, so this is a
+        # CUDA-only early return in practice.
         if get_is_capture_mode():
             return static_budget
 
         # Match the original free-memory guard: logits_bytes * 2 > free_mem.
-        # torch.cuda.mem_get_info synchronizes the host, so cache the result,
+        # Querying free memory synchronizes/reads the host, so cache the result,
         # capped by the workload-independent serving-memory headroom.
-        free_mem, _ = torch.cuda.mem_get_info(device_index)
+        if _is_cpu:
+            free_mem = int(get_available_gpu_memory("cpu", 0) * (1 << 30))
+        else:
+            free_mem, _ = torch.cuda.mem_get_info(device_index)
         budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
 
         budget_bytes = max(1, budget_bytes)
@@ -1290,26 +1313,93 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # instead of straddling two requests' disjoint k-ranges.
         extend_lens_cpu = metadata.get_dsa_extend_len_cpu()
         assert sum(extend_lens_cpu) == q_offset
-        cu_seqlens_q = torch.zeros(len(extend_lens_cpu) + 1, dtype=torch.int32)
-        cu_seqlens_q[1:] = torch.tensor(extend_lens_cpu, dtype=torch.int32).cumsum(0)
 
         assert q_fp8[:q_offset].shape[0] != 0
-        logits = torch.ops.sgl_kernel.fp8_mqa_logits_cpu(
-            q_fp8[:q_offset],
-            k_fp8,
-            k_scale,
-            weights[:q_offset],
-            ks,
-            ke,
-            cu_seqlens_q,
-            False,
+        need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
+            q_offset, k_offset, self._CPU_MQA_LOGITS_BUDGET_KEY
         )
-        assert logits.shape[0] == len(seq_lens_expanded)
-        assert logits.shape[1] == k_offset
 
-        self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
-        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
-        topk_result[:q_offset] = raw_topk_result
+        if not need_chunk:
+            cu_seqlens_q = torch.zeros(len(extend_lens_cpu) + 1, dtype=torch.int32)
+            cu_seqlens_q[1:] = torch.tensor(extend_lens_cpu, dtype=torch.int32).cumsum(
+                0
+            )
+            logits = torch.ops.sgl_kernel.fp8_mqa_logits_cpu(
+                q_fp8[:q_offset],
+                k_fp8,
+                k_scale,
+                weights[:q_offset],
+                ks,
+                ke,
+                cu_seqlens_q,
+                False,
+            )
+            assert logits.shape[0] == len(seq_lens_expanded)
+            assert logits.shape[1] == k_offset
+
+            self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
+            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            topk_result[:q_offset] = raw_topk_result
+            return topk_result
+
+        # The dense [num_q, k_offset] logits buffer would exceed the per-NUMA-node
+        # memory budget (k_fp8/k_scale stay full-size across chunks - only the
+        # quadratic-in-batch-size row dimension is bounded here, mirroring the
+        # CUDA/HIP _should_chunk_mqa_logits guard). Chunk on whole-request
+        # boundaries (never split one request's rows across chunks) so each
+        # chunk gets its own request-local cu_seqlens_q starting at 0.
+        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+        max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+        token_to_batch_idx = metadata.get_token_to_batch_idx()
+
+        start = 0
+        req_idx = 0
+        num_reqs = len(extend_lens_cpu)
+        while start < q_offset:
+            chunk_reqs = []
+            chunk_len = 0
+            while req_idx < num_reqs and (
+                chunk_len == 0 or chunk_len + extend_lens_cpu[req_idx] <= max_rows
+            ):
+                chunk_reqs.append(extend_lens_cpu[req_idx])
+                chunk_len += extend_lens_cpu[req_idx]
+                req_idx += 1
+            end = start + chunk_len
+
+            cu_seqlens_q_chunk = torch.zeros(len(chunk_reqs) + 1, dtype=torch.int32)
+            cu_seqlens_q_chunk[1:] = torch.tensor(
+                chunk_reqs, dtype=torch.int32
+            ).cumsum(0)
+
+            logits_chunk = torch.ops.sgl_kernel.fp8_mqa_logits_cpu(
+                q_fp8[start:end],
+                k_fp8,
+                k_scale,
+                weights[start:end],
+                ks[start:end],
+                ke[start:end],
+                cu_seqlens_q_chunk,
+                False,
+            )
+            assert logits_chunk.shape[1] == k_offset
+
+            lengths_chunk = seq_lens_expanded[start:end]
+            self._mask_init_and_local_tokens(
+                logits_chunk, lengths_chunk, ks[start:end]
+            )
+            # PAGED transform: each row is its own length-1 "sequence".
+            cu_seqlens_q_topk_chunk = torch.ones(end - start, dtype=torch.int32)
+            raw_topk_chunk = metadata.topk_transform(
+                logits_chunk,
+                self.index_topk,
+                ks=ks[start:end],
+                cu_seqlens_q=cu_seqlens_q_topk_chunk,
+                ke_offset=lengths_chunk,
+                batch_idx_list=token_to_batch_idx[start:end],
+            )
+            topk_result[start:end] = raw_topk_chunk
+            start = end
+
         return topk_result
 
     def _forward_cuda_k_only(
@@ -1601,8 +1691,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             device=block_tables.device,
         )
         block_tables = block_tables[:, strided_indices] // page_size
-        if _is_cpu and _cpu_amx:
-            index_k_with_scale_buffer = kv_pool.get_index_k_with_scale_buffer(layer_id)
 
         q_len_start = 0
 
@@ -1621,24 +1709,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             weights_partial = weights[q_len_start:q_len_end]
             weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
 
-            if _is_cpu and _cpu_amx:
-                k_fp8, k_scale = GetKAndS.execute_cpu(
-                    kv_pool,
-                    index_k_with_scale_buffer,
-                    seq_len,
-                    block_tables[i],
-                )
-            else:
-                k_fp8 = kv_pool.get_index_k_continuous(
-                    layer_id,
-                    seq_len,
-                    block_tables[i],
-                )
-                k_scale = kv_pool.get_index_k_scale_continuous(
-                    layer_id,
-                    seq_len,
-                    block_tables[i],
-                )
+            k_fp8 = kv_pool.get_index_k_continuous(
+                layer_id,
+                seq_len,
+                block_tables[i],
+            )
+            k_scale = kv_pool.get_index_k_scale_continuous(
+                layer_id,
+                seq_len,
+                block_tables[i],
+            )
 
             k_fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
             k_fp8 = k_fp8.view(k_fp8_dtype).unsqueeze(0).contiguous()

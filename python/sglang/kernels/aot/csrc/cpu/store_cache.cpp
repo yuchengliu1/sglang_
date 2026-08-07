@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <tuple>
+#include <vector>
 
 #include "common.h"
 
@@ -488,6 +491,101 @@ at::Tensor get_s_cpu(
   });
 
   return s_out;
+}
+
+// get_k_and_s_cpu: fused BATCHED gather of both index key (fp8, viewed as
+// uint8) and scale (fp32, viewed as 4 bytes uint8) data from a paged buffer
+// for NSA index cache. CPU counterpart of the fused `_get_k_and_s_triton`
+// kernel; unlike get_k_cpu/get_s_cpu (1D single-sequence only), this supports
+// an arbitrary number of batches in one call.
+//
+// Buffer layout per page (buf shape: [num_pages, buf_numel_per_page]):
+//   K data region: page_size * index_head_dim bytes (fp8 key data)
+//   S data region: page_size * 4 bytes (fp32 scale per token)
+//
+// page_indices is 2D [num_batch, page_indice_batch_offset]; each row holds the
+// page indices used by that batch's sequence. seq_lens[b] is the number of
+// valid tokens gathered for batch b, and outputs are laid out contiguously in
+// token order across batches (total seq_len_sum tokens).
+//
+std::tuple<at::Tensor, at::Tensor> get_k_and_s_cpu(
+    at::Tensor& buf,           // [num_pages, buf_numel_per_page], uint8
+    at::Tensor& page_indices,  // [num_batch, page_indice_batch_offset], int32 or int64
+    at::Tensor& seq_lens,      // [num_batch], int32 or int64
+    int64_t seq_len_sum,
+    int64_t page_size,
+    int64_t index_head_dim) {
+  const int64_t num_batch = seq_lens.size(0);
+  const int64_t page_indice_batch_offset = page_indices.size(1);
+  const int64_t buf_numel_per_page = buf.size(1);
+  const int64_t num_k_bytes_per_token = index_head_dim;
+  const int64_t num_s_bytes_per_token = 4;  // fp32 = 4 bytes
+  const int64_t s_offset_in_page = page_size * index_head_dim;
+
+  auto k_out = at::empty({seq_len_sum, index_head_dim}, buf.options());
+  auto s_out = at::empty({seq_len_sum, num_s_bytes_per_token}, buf.options());
+
+  const uint8_t* buf_ptr = buf.data_ptr<uint8_t>();
+  uint8_t* k_out_ptr = k_out.data_ptr<uint8_t>();
+  uint8_t* s_out_ptr = s_out.data_ptr<uint8_t>();
+
+  const bool seq_is_int64 = (seq_lens.scalar_type() == at::kLong);
+  const bool pi_is_int64 = (page_indices.scalar_type() == at::kLong);
+  const int32_t* pi_i32 = pi_is_int64 ? nullptr : page_indices.data_ptr<int32_t>();
+  const int64_t* pi_i64 = pi_is_int64 ? page_indices.data_ptr<int64_t>() : nullptr;
+
+  // Prefix-sum of per-batch token counts, so a global output token index can be
+  // mapped back to (batch, token_in_batch).
+  std::vector<int64_t> batch_start(num_batch + 1, 0);
+  for (int64_t b = 0; b < num_batch; ++b) {
+    const int64_t sl = seq_is_int64 ? seq_lens.data_ptr<int64_t>()[b]
+                                    : static_cast<int64_t>(seq_lens.data_ptr<int32_t>()[b]);
+    batch_start[b + 1] = batch_start[b] + sl;
+  }
+
+  at::parallel_for(0, seq_len_sum, 0, [&](int64_t begin, int64_t end) {
+    // Locate the batch that the first token of this chunk belongs to.
+    int64_t b =
+        std::upper_bound(batch_start.begin(), batch_start.end(), begin) - batch_start.begin() - 1;
+    for (int64_t g = begin; g < end; ++g) {
+      while (b + 1 <= num_batch && g >= batch_start[b + 1]) ++b;
+      const int64_t token_in_batch = g - batch_start[b];
+      const int64_t page_idx = token_in_batch / page_size;
+      const int64_t token_off = token_in_batch % page_size;
+
+      const int64_t pi_index = b * page_indice_batch_offset + page_idx;
+      const int64_t page_index = pi_is_int64 ? pi_i64[pi_index] : static_cast<int64_t>(pi_i32[pi_index]);
+
+      // --- K gather: copy index_head_dim bytes (fp8) ---
+      const int64_t k_src_offset = page_index * buf_numel_per_page + token_off * num_k_bytes_per_token;
+      const uint8_t* k_src = buf_ptr + k_src_offset;
+      uint8_t* k_dst = k_out_ptr + g * num_k_bytes_per_token;
+
+#if defined(CPU_CAPABILITY_AVX512)
+      // index_head_dim=128: 2 x 64-byte AVX512 loads/stores
+      {
+        int64_t d = 0;
+        for (; d + 64 <= num_k_bytes_per_token; d += 64) {
+          __m512i v = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(k_src + d));
+          _mm512_storeu_si512(reinterpret_cast<__m512i*>(k_dst + d), v);
+        }
+        if (d < num_k_bytes_per_token) {
+          std::memcpy(k_dst + d, k_src + d, num_k_bytes_per_token - d);
+        }
+      }
+#else
+      std::memcpy(k_dst, k_src, num_k_bytes_per_token);
+#endif
+
+      // --- S gather: copy 4 bytes (fp32 scale) ---
+      const int64_t s_src_offset =
+          page_index * buf_numel_per_page + s_offset_in_page + token_off * num_s_bytes_per_token;
+      uint8_t* s_dst = s_out_ptr + g * num_s_bytes_per_token;
+      *reinterpret_cast<uint32_t*>(s_dst) = *reinterpret_cast<const uint32_t*>(buf_ptr + s_src_offset);
+    }
+  });
+
+  return {k_out, s_out};
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16) {
