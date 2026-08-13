@@ -1658,7 +1658,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
         elif _is_cpu and _cpu_amx:
             from sglang.srt.layers.attention.dsa.cpu_kernel import fp8_index
-            from sglang.srt.layers.attention.dsa.index_buf_accessor import GetKAndS
 
         kv_pool = get_token_to_kv_pool()
         page_size = kv_pool.page_size

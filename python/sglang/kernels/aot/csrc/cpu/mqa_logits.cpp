@@ -27,38 +27,14 @@
 namespace {
 
 constexpr int64_t kHeadDim = 128;
-// AMX weight-packing granularity required by convert_weight_packed (TILE_N in gemm.h).
-constexpr int64_t kTileN = 16;
-
-// Efficient fp8_e4m3fn -> bf16 conversion using CVT_FP8_TO_BF16 from vec.h.
-// Processes 32 elements per AVX512 iteration (256-bit load, 512-bit store).
-void fp8_to_bf16(at::BFloat16* __restrict__ dst, const uint8_t* __restrict__ src, int64_t n) {
-#if defined(CPU_CAPABILITY_AVX512)
-  int64_t i = 0;
-  for (; i + 32 <= n; i += 32) {
-    __m512bh v = CVT_FP8_TO_BF16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)v);
-  }
-  for (; i < n; ++i) {
-    c10::Float8_e4m3fn x;
-    x.x = src[i];
-    dst[i] = at::BFloat16(static_cast<float>(x));
-  }
-#else
-  for (int64_t i = 0; i < n; ++i) {
-    c10::Float8_e4m3fn x;
-    x.x = src[i];
-    dst[i] = at::BFloat16(static_cast<float>(x));
-  }
-#endif
-}
 
 }  // namespace
 
 // Request-boundary-aligned KV-range-pruned GEMM + relu + per-head weighted
 // reduction, defined in gemm.cpp. Standalone - does not share code with
 // fused_linear_relu_reduce.
-extern void mqa_logits_gemm_kv_range(
+template <bool is_vnni>
+void mqa_logits_gemm_kv_range(
     at::Tensor& out,
     at::Tensor& q,
     at::Tensor& q_scale,
@@ -66,8 +42,11 @@ extern void mqa_logits_gemm_kv_range(
     at::Tensor& k_scale,
     at::Tensor& ks,
     at::Tensor& ke,
-    at::Tensor& cu_seqlens_q,
-    bool is_vnni);
+    at::Tensor& cu_seqlens_q);
+
+// Fuses fp8_e4m3fn -> bf16 conversion with VNNI packing, defined in gemm.cpp.
+template <bool parallelize_internally>
+at::Tensor convert_fp8_to_bf16_packed(at::Tensor& weight_fp8);
 
 at::Tensor fp8_mqa_logits_cpu(
     at::Tensor& q_fp8,
@@ -117,11 +96,6 @@ at::Tensor fp8_mqa_logits_cpu(
     return logits;
   }
 
-  // AMX weight packing (inside fused_linear_relu_reduce) requires the K row
-  // count to be a multiple of kTileN; pad with zero rows when needed. The
-  // padding rows are never read since fused_linear_relu_reduce only produces
-  // k_scale.size(0) == num_k output columns.
-  const int64_t num_k_pad = ((num_k + kTileN - 1) / kTileN) * kTileN;
   const auto bf16_opts = q_fp8.options().dtype(at::kBFloat16);
 
   auto q_bf16 = at::empty({num_q, num_heads, kHeadDim}, bf16_opts);
@@ -130,16 +104,9 @@ at::Tensor fp8_mqa_logits_cpu(
       reinterpret_cast<const uint8_t*>(q_fp8.const_data_ptr()),
       num_q * num_heads * kHeadDim);
 
-  at::Tensor k_bf16;
-  if (num_k_pad == num_k) {
-    k_bf16 = at::empty({num_k, kHeadDim}, bf16_opts);
-  } else {
-    k_bf16 = at::zeros({num_k_pad, kHeadDim}, bf16_opts);
-  }
-  fp8_to_bf16(
-      k_bf16.data_ptr<at::BFloat16>(), reinterpret_cast<const uint8_t*>(k_fp8.const_data_ptr()), num_k * kHeadDim);
+  auto k_packed = convert_fp8_to_bf16_packed<true>(k_fp8);
 
-  mqa_logits_gemm_kv_range(logits, q_bf16, weight, k_bf16, k_scale, ks, ke, cu_seqlens_q, /*is_vnni=*/false);
+  mqa_logits_gemm_kv_range<true>(logits, q_bf16, weight, k_packed, k_scale, ks, ke, cu_seqlens_q);
 
   return logits;
 }

@@ -74,15 +74,23 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
     def _make_inputs(
         self,
         *,
-        batch_size: int = 3,
+        seq_lens_list,
         num_heads: int = 4,
         max_seq_len: int = 192,
-        num_blocks: int = 8,
         index_dtype: torch.dtype = torch.int32,
         weight_dtype: torch.dtype = torch.float32,
         q_dtype: torch.dtype = torch.bfloat16,
+        num_blocks: int = None,
+        page_rows: list = None,
     ):
         torch.manual_seed(2)
+        batch_size = len(seq_lens_list)
+        pages_per_batch = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        # num_blocks/page_rows affect the RNG draw size (and thus every value
+        # drawn afterwards), so test_matches_torch_reference pins both to its
+        # original values instead of the auto-generated ones below.
+        if num_blocks is None:
+            num_blocks = batch_size * pages_per_batch
 
         q = (torch.randn(batch_size, 1, num_heads, HEAD_DIM) * 0.25).to(q_dtype)
         q_fp8 = q.to(torch.float8_e4m3fn).contiguous()
@@ -104,26 +112,43 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
             .to(weight_dtype)
             .contiguous()
         )
-        seq_lens = torch.tensor([0, 65, max_seq_len - 1], dtype=index_dtype)
+        seq_lens = torch.tensor(seq_lens_list, dtype=index_dtype)
 
-        pages_per_batch = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         page_table = torch.empty(batch_size, pages_per_batch, dtype=index_dtype)
-        page_table[0] = torch.tensor([0, 1, 2], dtype=index_dtype)
-        page_table[1] = torch.tensor([3, 4, 5], dtype=index_dtype)
-        page_table[2] = torch.tensor([2, 6, 7], dtype=index_dtype)
+        if page_rows is not None:
+            for i, row in enumerate(page_rows):
+                page_table[i] = torch.tensor(row, dtype=index_dtype)
+        else:
+            # Disjoint per-row pages: simpler than sharing blocks across rows
+            # and still exercises the paged gather across a row's own page
+            # boundaries.
+            for i in range(batch_size):
+                page_table[i] = torch.arange(
+                    i * pages_per_batch, (i + 1) * pages_per_batch, dtype=index_dtype
+                )
 
         return q_fp8, kvcache, weight, seq_lens, page_table, max_seq_len
 
     def _assert_matches_reference(
         self,
-        index_dtype: torch.dtype,
-        weight_dtype: torch.dtype,
+        seq_lens_list,
+        *,
+        max_seq_len: int = 192,
+        index_dtype: torch.dtype = torch.int32,
+        weight_dtype: torch.dtype = torch.float32,
         q_dtype: torch.dtype = torch.bfloat16,
+        num_blocks: int = None,
+        page_rows: list = None,
+        atol: float = None,
     ):
         q_fp8, kvcache, weight, seq_lens, page_table, max_seq_len = self._make_inputs(
+            seq_lens_list=seq_lens_list,
+            max_seq_len=max_seq_len,
             index_dtype=index_dtype,
             weight_dtype=weight_dtype,
             q_dtype=q_dtype,
+            num_blocks=num_blocks,
+            page_rows=page_rows,
         )
 
         actual = torch.ops.sgl_kernel.fp8_paged_mqa_logits_cpu(
@@ -148,7 +173,14 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
 
         self.assertEqual(actual.shape, (seq_lens.numel(), max_seq_len))
         self.assertEqual(actual.dtype, torch.float32)
-        atol = rtol = precision[q_dtype]
+        # atol may be loosened past precision[q_dtype] (rtol stays tight):
+        # summing several per-head weighted terms can cancel down to a small
+        # value, at which point brgemm-tiled-vs-plain-torch reduction-order
+        # rounding noise (negligible relative to the uncancelled per-head
+        # magnitudes) becomes non-negligible in absolute terms - see the same
+        # note in test_fp8_index_cpu.py.
+        rtol = precision[q_dtype]
+        atol = precision[q_dtype] if atol is None else atol
         for batch_idx, seq_len in enumerate(seq_lens.tolist()):
             if seq_len == 0:
                 continue
@@ -160,11 +192,34 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
             )
 
     def test_matches_torch_reference(self):
+        # num_blocks/page_rows pinned to the original values: num_blocks
+        # alone shifts every subsequent RNG draw (k/scales/weight), and a
+        # different draw can land closer to the reduction-order rounding
+        # noise inherent to comparing a brgemm-tiled sum against a plain
+        # torch reduction (see _assert_matches_reference's tolerance note).
         self._assert_matches_reference(
+            [0, 65, 191],
+            max_seq_len=192,
             index_dtype=torch.int32,
             weight_dtype=torch.float32,
             q_dtype=torch.bfloat16,
+            num_blocks=8,
+            page_rows=[[0, 1, 2], [3, 4, 5], [2, 6, 7]],
         )
+
+    def test_single_request_long_context(self):
+        # batch_size == 1 with a long, kv_chunk_size(512)-unaligned context:
+        # the only way to parallelize this case is to split one row's KV
+        # range across threads (schedule_paged_mqa_tasks), since there are no
+        # other rows to balance against.
+        self._assert_matches_reference([4000], max_seq_len=4096, atol=0.1)
+
+    def test_skewed_batch(self):
+        # One long request among many short ones: a naive per-row split would
+        # pin the whole long row to a single thread while the others sit
+        # idle; schedule_paged_mqa_tasks balances by cumulative KV-chunk cost
+        # instead.
+        self._assert_matches_reference([4000] + [16] * 15, max_seq_len=4096, atol=0.1)
 
 
 if __name__ == "__main__":

@@ -23,48 +23,17 @@
 //   out : [B, M, N]     float32
 
 // Fused GEMM + relu + per-head weighted reduction, defined in gemm.cpp.
-extern void fused_linear_relu_reduce(
+template <bool parallelize_internally, bool is_vnni>
+void fused_linear_relu_reduce(
     at::Tensor& out,
     at::Tensor& q,
     at::Tensor& q_scale,
     at::Tensor& k,
-    at::Tensor& k_scale,
-    bool is_vnni);
+    at::Tensor& k_scale);
 
-// AMX weight packing requires the GEMM output dimension (here the number of
-// key tokens N) to be a multiple of TILE_N (16). Pad the key rows up so the
-// packed path is always taken; the padding rows are never read since
-// fused_linear_relu_reduce only produces k_scale.size(0) output columns.
-constexpr int64_t kTileN = 16;
-
-// Efficient fp8_e4m3fn → bf16 conversion using CVT_FP8_TO_BF16 from vec.h.
-// Processes 32 elements per AVX512 iteration (256-bit load, 512-bit store).
-// Avoids the torch .to() path which routes through float32 intermediates.
-static void fp8_to_bf16(
-    at::BFloat16* __restrict__ dst,
-    const uint8_t* __restrict__ src,
-    int64_t n) {
-#if defined(CPU_CAPABILITY_AVX512)
-  int64_t i = 0;
-  for (; i + 32 <= n; i += 32) {
-    __m512bh v = CVT_FP8_TO_BF16(
-        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)v);
-  }
-  // scalar tail (< 32 elements)
-  for (; i < n; ++i) {
-    c10::Float8_e4m3fn x;
-    x.x = src[i];
-    dst[i] = at::BFloat16(static_cast<float>(x));
-  }
-#else
-  for (int64_t i = 0; i < n; ++i) {
-    c10::Float8_e4m3fn x;
-    x.x = src[i];
-    dst[i] = at::BFloat16(static_cast<float>(x));
-  }
-#endif
-}
+// Fuses fp8_e4m3fn -> bf16 conversion with VNNI packing, defined in gemm.cpp.
+template <bool parallelize_internally>
+at::Tensor convert_fp8_to_bf16_packed(at::Tensor& weight_fp8);
 
 at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tensor& k_s) {
   CHECK_INPUT(q);
@@ -102,7 +71,6 @@ at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tens
     return out;
   }
 
-  const int64_t N_pad = ((N + kTileN - 1) / kTileN) * kTileN;
   const auto bf16_opts = q.options().dtype(at::kBFloat16);
 
   // Q[0]: [1, M, H, D] fp8 → [M, H, D] bf16.
@@ -113,24 +81,15 @@ at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tens
       reinterpret_cast<const uint8_t*>(q.const_data_ptr()),
       M * H * D);
 
-  // K[0]: [1, N, D] fp8 → [N_pad, D] bf16.
-  // If N_pad > N the extra rows must be zero (padding); otherwise no zeroing needed.
-  at::Tensor k_bf16;
-  if (N_pad == N) {
-    k_bf16 = at::empty({N, D}, bf16_opts);
-  } else {
-    k_bf16 = at::zeros({N_pad, D}, bf16_opts);
-  }
-  fp8_to_bf16(
-      k_bf16.data_ptr<at::BFloat16>(),
-      reinterpret_cast<const uint8_t*>(k.const_data_ptr()),
-      N * D);
+  // K[0]: [1, N, D] fp8 → [N_pad, D] bf16, VNNI-packed in one fused pass.
+  at::Tensor k_fp8 = k.select(0, 0);  // [N, D]
+  at::Tensor k_packed = convert_fp8_to_bf16_packed<true>(k_fp8);
 
   // Views into q_s/k_s/out — no data copies.
   at::Tensor q_scale = q_s.select(0, 0);  // [M, H]
   at::Tensor k_scale = k_s.select(0, 0);  // [N]
   at::Tensor out_b   = out.select(0, 0);  // [M, N]
-  fused_linear_relu_reduce(out_b, q_bf16, q_scale, k_bf16, k_scale, /*is_vnni=*/false);
+  fused_linear_relu_reduce<true, true>(out_b, q_bf16, q_scale, k_packed, k_scale);
 
   return out;
 }

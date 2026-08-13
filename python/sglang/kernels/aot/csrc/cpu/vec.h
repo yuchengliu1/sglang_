@@ -6,6 +6,7 @@
 
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
+#include <c10/util/Float8_e4m3fn.h>
 
 namespace {
 
@@ -220,6 +221,29 @@ inline std::tuple<__m512bh, __m512bh> cvt_mxfp4_e2m1_bf16_intrinsic_lut(__m256i 
 #pragma GCC diagnostic pop
 
 #endif
+
+// Efficient fp8_e4m3fn -> bf16 conversion, shared by gemm.cpp's
+// convert_fp8_to_bf16_packed and the mqa_logits/fp8_index/paged_mqa_logits ops.
+inline void fp8_to_bf16(at::BFloat16* __restrict__ dst, const uint8_t* __restrict__ src, int64_t n) {
+#if defined(CPU_CAPABILITY_AVX512)
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m512bh v = CVT_FP8_TO_BF16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)v);
+  }
+  for (; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
+#else
+  for (int64_t i = 0; i < n; ++i) {
+    c10::Float8_e4m3fn x;
+    x.x = src[i];
+    dst[i] = at::BFloat16(static_cast<float>(x));
+  }
+#endif
+}
 
 // vector to scalar reduction
 #if defined(CPU_CAPABILITY_AVX512)
