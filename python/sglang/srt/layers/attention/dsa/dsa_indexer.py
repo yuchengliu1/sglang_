@@ -96,6 +96,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 
+_CPU_SKIP_INDEXER_HADAMARD = True
+
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -396,7 +398,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
         # index-K cache here matches the fused path that decode reads back.
-        return x if self.use_dsa_indexer_fusion else rotate_activation(x)
+        return x if self.use_dsa_indexer_fusion or (_is_cpu and _CPU_SKIP_INDEXER_HADAMARD) else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # When kv_len <= index_topk the top-k selects ALL valid positions, so the
@@ -588,7 +590,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = rotate_activation(key)
+        key = self._maybe_rotate(key)
 
         return key
 
