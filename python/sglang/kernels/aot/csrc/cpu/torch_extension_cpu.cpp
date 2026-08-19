@@ -597,6 +597,25 @@ std::tuple<at::Tensor, at::Tensor> get_k_and_s_cpu(
     int64_t page_size,
     int64_t index_head_dim);
 
+// DSA indexer fused kernels (DeepSeek-V3.2 only)
+void fused_k_indexer_norm_rope_store_cpu(
+    at::Tensor& k_input,
+    at::Tensor& cache,
+    at::Tensor& out_cache_loc,
+    at::Tensor& weight,
+    at::Tensor& bias,
+    double eps,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions,
+    int64_t page_size);
+
+std::tuple<at::Tensor, at::Tensor> fused_q_indexer_rope_first_quant_cpu(
+    at::Tensor& q_input,
+    at::Tensor& weight_raw,
+    double weight_scale,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions);
+
 // compressor
 at::Tensor compress_decode_cpu(
     at::Tensor& pool_kv,
@@ -1172,6 +1191,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant_to_nope_fp8_rope_bf16_pack
   m.def("quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
   m.impl("quant_to_nope_fp8_rope_bf16_pack_cpu", torch::kCPU, &quant_to_nope_fp8_rope_bf16_pack_cpu);
+
+  // DSA indexer fused kernels (DeepSeek-V3.2 only)
+  m.def(
+      "fused_k_indexer_norm_rope_store_cpu(Tensor k_input, Tensor(a!) cache, Tensor out_cache_loc, "
+      "Tensor weight, Tensor bias, float eps, Tensor cos_sin_cache, Tensor positions, int page_size) -> ()");
+  m.impl("fused_k_indexer_norm_rope_store_cpu", torch::kCPU, &fused_k_indexer_norm_rope_store_cpu);
+
+  m.def(
+      "fused_q_indexer_rope_first_quant_cpu(Tensor q_input, Tensor weight_raw, float weight_scale, "
+      "Tensor cos_sin_cache, Tensor positions) -> (Tensor, Tensor)");
+  m.impl("fused_q_indexer_rope_first_quant_cpu", torch::kCPU, &fused_q_indexer_rope_first_quant_cpu);
 
   // compressor
   m.def(

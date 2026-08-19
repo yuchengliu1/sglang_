@@ -248,7 +248,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.use_dsa_indexer_fusion = (
-            _is_cuda
+            (_is_cuda or _is_cpu)
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
@@ -611,6 +611,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
+        if _is_cpu:
+            if not out_cache_loc.is_contiguous():
+                out_cache_loc = out_cache_loc.contiguous()
+            torch.ops.sgl_kernel.fused_k_indexer_norm_rope_store_cpu(
+                key_raw,
+                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                out_cache_loc,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                self._indexer_cos_sin_cache,
+                positions,
+                page_size,
+            )
+            return
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
@@ -644,6 +659,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key=key,
             act_quant=act_quant,
             out_cache_loc=out_cache_loc,
+        )
+
+    def _fused_q_rope_quant(
+        self,
+        q: torch.Tensor,
+        weights_raw: torch.Tensor,
+        q_scale_gate: float,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _is_cpu:
+            return torch.ops.sgl_kernel.fused_q_indexer_rope_first_quant_cpu(
+                q, weights_raw, q_scale_gate, self._indexer_cos_sin_cache, positions
+            )
+        return fused_q_indexer_rope_first_quant(
+            q, weights_raw, q_scale_gate, self._indexer_cos_sin_cache, positions
         )
 
     def _fused_q_prepare_and_store(
@@ -683,12 +713,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             if num_tokens is not None:
                 q = q[:num_tokens]
-            return fused_q_indexer_rope_first_quant(
-                q.contiguous(),
-                weights_raw,
-                q_scale_gate,
-                self._indexer_cos_sin_cache,
-                positions,
+            return self._fused_q_rope_quant(
+                q.contiguous(), weights_raw, q_scale_gate, positions
             )
 
         # Two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
@@ -710,12 +736,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
-        q_fp8, weights = fused_q_indexer_rope_first_quant(
-            q.contiguous(),
-            weights_raw,
-            q_scale_gate,
-            self._indexer_cos_sin_cache,
-            positions,
+        q_fp8, weights = self._fused_q_rope_quant(
+            q.contiguous(), weights_raw, q_scale_gate, positions
         )
         with torch.cuda.stream(self.alt_stream):
             self._fused_k_prepare_and_store(
@@ -2240,9 +2262,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights_proj_lora = not self.use_dsa_indexer_fusion and getattr(
             self.weights_proj, "set_lora", False
         )
-        if forward_batch.forward_mode.is_decode_or_idle():
-            if not self.use_dsa_indexer_fusion:
-                weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
+        if self.use_dsa_indexer_fusion and forward_batch.attn_cp_metadata is None:
+            q_fp8, weights = self._fused_q_prepare_and_store(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant_cpu,
+                enable_dual_stream=False,
+            )
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, False, forward_batch=forward_batch
             )
@@ -2253,10 +2284,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key=key,
                 act_quant=act_quant_cpu,
             )
-            if self.use_dsa_indexer_fusion:
-                weights = self._scale_head_gates(weights_raw, q_scale)
-            else:
-                weights = weights.unsqueeze(-1) * (q_scale * self.softmax_scale)
+            weights = weights.unsqueeze(-1) * (q_scale * self.softmax_scale)
         else:
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, False, forward_batch=forward_batch
@@ -2297,7 +2325,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     x_for_gate = x_q.to(torch.bfloat16)
             else:
                 x_for_gate = x
-            weights = self._get_logits_head_gate(x_for_gate, q_scale)
+            if weights_proj_lora:
+                weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
+                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+            else:
+                weights = self._get_logits_head_gate(x_for_gate, q_scale)
         if (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
