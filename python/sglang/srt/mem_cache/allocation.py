@@ -67,7 +67,7 @@ def write_cache_indices(
     # This writer's one caller is `alloc_for_extend`, so the prefill half
     # decides; the fallback below pays several `.item()` syncs per request.
     prefill_backend, _ = attention_backends()
-    if support_triton(prefill_backend):
+    if support_triton(prefill_backend) and not is_cpu:
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,

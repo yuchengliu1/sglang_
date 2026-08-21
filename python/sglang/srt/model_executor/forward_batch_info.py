@@ -1749,7 +1749,7 @@ def compute_position(
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
 ):
-    if support_triton(attn_backend):
+    if support_triton(attn_backend) and not _is_cpu:
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,

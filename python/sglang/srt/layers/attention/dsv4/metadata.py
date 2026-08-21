@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip, is_xpu
 
 if TYPE_CHECKING:
     pass
@@ -125,6 +125,7 @@ class PagedIndexerMetadata:
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or (is_cpu() and cpu_has_amx_support())
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
@@ -154,7 +155,9 @@ class PagedIndexerMetadata:
 
         from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and not (
+            is_cpu() and cpu_has_amx_support()
+        ):
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))

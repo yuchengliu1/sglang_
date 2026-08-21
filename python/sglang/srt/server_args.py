@@ -8180,6 +8180,13 @@ class ServerArgs:
             if not supported:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
+        if is_cpu():
+            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM on CPU path as not supported "
+                )
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
     def _handle_cache_compatibility(self):
         if (
             self.disaggregation_decode_retraction_backup == "host_pool"
