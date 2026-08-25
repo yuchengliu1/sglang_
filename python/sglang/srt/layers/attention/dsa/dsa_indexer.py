@@ -131,6 +131,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_req_to_token_pool,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -1666,7 +1667,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         return topk_result
 
-    def forward_indexer(
+    def forward_indexer_cpu(
         self,
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
@@ -1674,14 +1675,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         topk: int,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
-        assert not _is_in_piecewise_or_breakable_cuda_graph(), (
-            "DSA forward_indexer (non-CUDA loop path) not supported under "
-            "piecewise/breakable CUDA graph"
-        )
-        if not (_is_npu or _is_cpu):
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
-        elif _is_cpu and _cpu_amx:
-            from sglang.srt.layers.attention.dsa.cpu_kernel import fp8_index
+        from sglang.srt.layers.attention.dsa.cpu_kernel import fp8_index
 
         kv_pool = get_token_to_kv_pool()
         page_size = kv_pool.page_size
@@ -1743,8 +1737,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 block_tables[i],
             )
 
-            k_fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
-            k_fp8 = k_fp8.view(k_fp8_dtype).unsqueeze(0).contiguous()
+            k_fp8 = k_fp8.view(torch.float8_e4m3fn).unsqueeze(0).contiguous()
             k_scale = k_scale.view(torch.float32).squeeze(-1).unsqueeze(0).contiguous()
 
             index_score = fp8_index(
@@ -2248,7 +2241,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 forward_batch,
                 layer_id,
                 act_quant_cpu,
-                False,
                 metadata,
                 return_indices,
             )
@@ -2346,7 +2338,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights,
                 metadata,
             )
-        # topk_result = self.forward_indexer(
+        # topk_result = self.forward_indexer_cpu(
         #         q_fp8.contiguous(),
         #         weights,
         #         forward_batch,

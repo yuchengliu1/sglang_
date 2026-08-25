@@ -574,9 +574,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         masking uses -1 sentinels inside ``indices``), so it is safe (if a bit
         conservative performance-wise) to always scan the full topk width.
         """
-        from sglang.srt.layers.attention.dsa.transform_index import (
-            transform_index_page_table_decode,
-            transform_index_page_table_prefill,
+        from sglang.kernels.ops.attention.dsa.transform_index import (
+            transform_index_page_table_decode_ref as transform_index_page_table_decode,
+            transform_index_page_table_prefill_ref as transform_index_page_table_prefill,
         )
 
         assert self.dsa_metadata is not None
