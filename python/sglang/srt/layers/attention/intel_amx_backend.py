@@ -332,7 +332,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 max_seqlen_q = (
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
                 )
-                cu_seqlens_q = compute_cu_seqlens(extend_seq_lens.to(torch.int32))
+                cu_seqlens_q = compute_cu_seqlens(extend_seq_lens)
             else:
                 max_seqlen_q = max_seqlen_k
                 cu_seqlens_q = cu_seqlens_k
@@ -359,12 +359,10 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         self._init_flashmla_cpu_indices(
             forward_batch=forward_batch,
-            batch_size=batch_size,
             device=device,
-            cache_seqlens_int32=cache_seqlens_int32,
             max_seqlen_k=max_seqlen_k,
             page_table=page_table,
-            max_seqlen_q=max_seqlen_q,
+            seqlens_expanded=seqlens_expanded,
         )
 
         self.dsa_metadata = DSAMetadata(
@@ -403,12 +401,10 @@ class IntelAMXAttnBackend(AttentionBackend):
     def _init_flashmla_cpu_indices(
         self,
         forward_batch: ForwardBatch,
-        batch_size: int,
         device: torch.device,
-        cache_seqlens_int32: torch.Tensor,
         max_seqlen_k: int,
         page_table: torch.Tensor,
-        max_seqlen_q: int,
+        seqlens_expanded: torch.Tensor,
     ):
         """Precompute (once per forward pass, reused by every layer) the
         ``indices``/``topk_length`` tensors needed to run CPU attention via
@@ -417,37 +413,22 @@ class IntelAMXAttnBackend(AttentionBackend):
         selection: it simply gathers the whole (causal) KV range for each
         query token through the sparse-kernel interface, using -1 as the
         sentinel for out-of-range / future positions.
+
+        Every query token (decode or extend) is treated as its own batch=1
+        row, matching ``seqlens_expanded``'s per-token layout, so no request
+        needs padding up to the batch's max extend length.
         """
-        page_table_i32 = page_table.to(torch.int32)
         col_idx = torch.arange(max_seqlen_k, dtype=torch.int32, device=device)
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            mask = col_idx[None, :] < cache_seqlens_int32[:, None]
-            indices = page_table_i32.clone()
-            indices[~mask] = -1
-            self._fmla_indices = indices.unsqueeze(1)  # [bs, 1, max_seqlen_k]
-            self._fmla_topk_length = cache_seqlens_int32.to(torch.int32).contiguous()
-            self._fmla_s_q = 1
+            indices = page_table.clone()
         else:
-            prefix_lens_cpu = (
-                forward_batch.extend_prefix_lens_cpu
-                if forward_batch.extend_prefix_lens_cpu is not None
-                else [0] * batch_size
-            )
-            prefix_lens = torch.tensor(prefix_lens_cpu, dtype=torch.int32, device=device)
-            s_idx = torch.arange(max_seqlen_q, dtype=torch.int32, device=device)
-            # kv length visible to query row s (0-indexed within the chunk)
-            row_len = prefix_lens[:, None] + s_idx[None, :] + 1  # [bs, s_q]
-            mask = col_idx[None, None, :] < row_len[:, :, None]  # [bs, s_q, max_seqlen_k]
-            indices = (
-                page_table_i32[:, None, :]
-                .expand(batch_size, max_seqlen_q, max_seqlen_k)
-                .clone()
-            )
-            indices[~mask] = -1
-            self._fmla_indices = indices
-            self._fmla_topk_length = cache_seqlens_int32.to(torch.int32).contiguous()
-            self._fmla_s_q = max_seqlen_q
+            indices = page_table.repeat_interleave(forward_batch.extend_seq_lens, dim=0)
+
+        mask = col_idx[None, :] < seqlens_expanded[:, None]
+        indices[~mask] = -1
+        self._fmla_indices = indices.unsqueeze(1)  # [total_tokens, 1, max_seqlen_k]
+        self._fmla_topk_length = seqlens_expanded.contiguous()
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         from sglang.srt.layers.attention.dsa_backend import DSAIndexerMetadata
@@ -562,13 +543,15 @@ class IntelAMXAttnBackend(AttentionBackend):
         self,
         topk_indices: torch.Tensor,
         forward_batch: ForwardBatch,
-        batch_size: int,
-        s_q: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert the indexer's logical top-k sequence positions into
         physical KV-pool slot ids (``indices``) usable by
         ``flash_mla_with_kvcache_cpu``, plus a matching ``topk_length`` bound.
+
+        ``topk_indices`` already carries one row per query token (decode or
+        extend alike), so the result only needs an ``unsqueeze(1)`` to add the
+        kernel's S_q=1 axis — no per-request padding is needed.
 
         ``topk_length`` is only a loop-bound optimization for the kernel (real
         masking uses -1 sentinels inside ``indices``), so it is safe (if a bit
@@ -588,7 +571,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         # in, so topk_indices here are ALREADY page_size=1 physical slots; re-running the
         # transform below would gather through the page table a second time (mirrors GPU's
         # `_get_fused_topk_page_table` passthrough in dsa_backend.py).
-        if s_q == 1:
+        if forward_batch.forward_mode.is_decode_or_idle():
             indices_phys = (
                 topk_indices
                 if self.dsa_topk_indices_already_physical
@@ -598,7 +581,6 @@ class IntelAMXAttnBackend(AttentionBackend):
                     page_size=1,
                 )
             )
-            indices = indices_phys.unsqueeze(1)  # [bs, 1, index_topk]
         else:
             indices_phys = (
                 topk_indices
@@ -610,16 +592,10 @@ class IntelAMXAttnBackend(AttentionBackend):
                     page_size=1,
                 )
             )
-            start_locs = forward_batch.extend_start_loc.tolist()
-            ext_lens = forward_batch.extend_seq_lens_cpu
-            indices = indices_phys.new_full((batch_size, s_q, index_topk), -1)
-            for b in range(batch_size):
-                length = ext_lens[b]
-                start = start_locs[b]
-                indices[b, :length] = indices_phys[start : start + length]
 
+        indices = indices_phys.unsqueeze(1)  # [total_tokens, 1, index_topk]
         topk_length = torch.full(
-            (batch_size,), index_topk, dtype=torch.int32, device=device
+            (indices.shape[0],), index_topk, dtype=torch.int32, device=device
         )
         return indices, topk_length
 
@@ -645,66 +621,37 @@ class IntelAMXAttnBackend(AttentionBackend):
         num_heads = layer.tp_q_head_num
         head_dim_qk = layer.qk_head_dim
         head_dim_v = layer.v_head_dim
-        batch_size = forward_batch.batch_size
-        s_q = self._fmla_s_q
 
         q_flat = q.reshape(-1, num_heads, head_dim_qk)
         if q_flat.dtype != torch.bfloat16:
             q_flat = q_flat.to(torch.bfloat16)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        if k_cache.dtype != torch.bfloat16:
-            k_cache = k_cache.to(torch.bfloat16)
         k_cache = k_cache.unsqueeze(0).contiguous()  # [1, capacity, 1, head_dim_qk]
 
         if topk_indices is not None:
             fmla_indices, fmla_topk_length = self._get_real_topk_indices(
-                topk_indices, forward_batch, batch_size, s_q, q_flat.device
+                topk_indices, forward_batch, q_flat.device
             )
         else:
             fmla_indices, fmla_topk_length = self._fmla_indices, self._fmla_topk_length
 
-        if s_q == 1:
-            q_view = q_flat.view(batch_size, 1, num_heads, head_dim_qk)
-            out, _ = flash_mla_with_kvcache_cpu(
-                q=q_view,
-                k_cache=k_cache,
-                block_table=None,
-                cache_seqlens=None,
-                head_dim_v=head_dim_v,
-                softmax_scale=layer.scaling,
-                is_fp8_kvcache=False,
-                indices=fmla_indices,
-                topk_length=fmla_topk_length,
-            )
-            o_flat = out.view(-1, num_heads, head_dim_v)
-        else:
-            start_locs = forward_batch.extend_start_loc.tolist()
-            ext_lens = forward_batch.extend_seq_lens_cpu
-
-            q_padded = q_flat.new_zeros((batch_size, s_q, num_heads, head_dim_qk))
-            for b in range(batch_size):
-                length = ext_lens[b]
-                start = start_locs[b]
-                q_padded[b, :length] = q_flat[start : start + length]
-
-            out, _ = flash_mla_with_kvcache_cpu(
-                q=q_padded,
-                k_cache=k_cache,
-                block_table=None,
-                cache_seqlens=None,
-                head_dim_v=head_dim_v,
-                softmax_scale=layer.scaling,
-                is_fp8_kvcache=False,
-                indices=fmla_indices,
-                topk_length=fmla_topk_length,
-            )
-
-            o_flat = q_flat.new_empty((q_flat.shape[0], num_heads, head_dim_v))
-            for b in range(batch_size):
-                length = ext_lens[b]
-                start = start_locs[b]
-                o_flat[start : start + length] = out[b, :length]
+        # Every query token (decode or extend) is its own batch=1, S_q=1 row,
+        # so no request needs padding up to the batch's max extend length.
+        q_view = q_flat.view(-1, 1, num_heads, head_dim_qk)
+        out, _ = flash_mla_with_kvcache_cpu(
+            q=q_view,
+            k_cache=k_cache,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=head_dim_v,
+            softmax_scale=layer.scaling,
+            is_fp8_kvcache=k_cache.dtype == torch.float8_e4m3fn,
+            fp8_layout=1, # unused when is_fp8_kvcache=False
+            indices=fmla_indices,
+            topk_length=fmla_topk_length,
+        )
+        o_flat = out.view(-1, num_heads, head_dim_v)
 
         if layer.qk_head_dim != layer.v_head_dim:
             return o_flat.reshape(-1, num_heads * head_dim_v)
