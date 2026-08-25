@@ -348,7 +348,7 @@ class RotaryEmbedding(BaseFusedOp):
         ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if _is_cpu_amx_available and False:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions,
                 query,

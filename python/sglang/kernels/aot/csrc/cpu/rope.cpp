@@ -16,42 +16,52 @@ struct RopeParams {
   int64_t q_strideB{0}, q_strideS{0}, q_strideH{0};
   int64_t k_strideB{0}, k_strideS{0}, k_strideH{0};
 
+  // query and key may have different ndim, e.g. 3D q_pe with 2D k_pe in MLA.
   RopeParams(const at::Tensor& query, const at::Tensor& key, int64_t head_size_, int64_t rotary_dim_)
       : rotary_dim(rotary_dim_), head_size(head_size_) {
-    int64_t ndim = query.dim();
-    switch (ndim) {
+    switch (query.dim()) {
       case 2:
         seqlen = query.size(0);
         num_heads = query.size(1) / head_size;
-        num_heads_kv = key.size(1) / head_size;
         q_strideS = query.stride(0);
-        k_strideS = key.stride(0);
         q_strideH = head_size;
-        k_strideH = head_size;
         break;
       case 3:
         seqlen = query.size(0);
         num_heads = query.size(1);
-        num_heads_kv = key.size(1);
         q_strideS = query.stride(0);
-        k_strideS = key.stride(0);
         q_strideH = query.stride(1);
-        k_strideH = key.stride(1);
         break;
       case 4:
         batches = query.size(0);
         seqlen = query.size(1);
         num_heads = query.size(2);
-        num_heads_kv = key.size(2);
         q_strideB = query.stride(0);
-        k_strideB = key.stride(0);
         q_strideS = query.stride(1);
-        k_strideS = key.stride(1);
         q_strideH = query.stride(2);
+        break;
+      default:
+        TORCH_CHECK(false, "Expected query to be a 2D/3D/4D tensor, got ", query.dim(), "D.");
+    }
+    switch (key.dim()) {
+      case 2:
+        num_heads_kv = key.size(1) / head_size;
+        k_strideS = key.stride(0);
+        k_strideH = head_size;
+        break;
+      case 3:
+        num_heads_kv = key.size(1);
+        k_strideS = key.stride(0);
+        k_strideH = key.stride(1);
+        break;
+      case 4:
+        num_heads_kv = key.size(2);
+        k_strideB = key.stride(0);
+        k_strideS = key.stride(1);
         k_strideH = key.stride(2);
         break;
       default:
-        TORCH_CHECK(false, "Expected a 2D/3D/4D tensor, got ", ndim, "D.");
+        TORCH_CHECK(false, "Expected key to be a 2D/3D/4D tensor, got ", key.dim(), "D.");
     }
   }
 
@@ -309,7 +319,7 @@ void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Ten
 }
 
 // 2D : [num_tokens, num_heads*head_size] inplace
-// 3D : [num_tokens, num_heads, head_size] outplace
+// 3D : [num_tokens, num_heads, head_size] outplace (key may be 2D, e.g. MLA q_pe/k_pe)
 // 4D : [batch_size, seq_len, num_heads, head_size] inplace
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
@@ -319,9 +329,15 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& cos_sin_cache,
     bool is_neox) {
   CHECK_DIM(1, positions);
-  const auto input_dim = query.dim();
+  const auto query_dim = query.dim();
+  const auto key_dim = key.dim();
   const auto input_dtype = query.scalar_type();
-  TORCH_CHECK(input_dim >= 2 && input_dim <= 4, "Query/Key must be 2D/3D/4D, got ", input_dim, "D.");
+  TORCH_CHECK(query_dim >= 2 && query_dim <= 4, "Query must be 2D/3D/4D, got ", query_dim, "D.");
+  TORCH_CHECK(key_dim >= 2 && key_dim <= 4, "Key must be 2D/3D/4D, got ", key_dim, "D.");
+  TORCH_CHECK(
+      (query_dim == 2 && key_dim == 2) || (query_dim == 3 && (key_dim == 2 || key_dim == 3)) ||
+          (query_dim == 4 && key_dim == 4),
+      "Query/Key dimensions mismatch for rotary_embedding_cpu: query dim=", query_dim, ", key dim=", key_dim);
 
   CHECK_DIM(2, cos_sin_cache);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
@@ -336,28 +352,28 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   TORCH_CHECK(p.rotary_dim % 2 == 0, "rotary_dim must be even");
   TORCH_CHECK(positions.numel() == p.rows(), "positions.numel() must equal batch * seqlen");
 
-  if (input_dim <= 3) {
+  if (query_dim <= 3) {
     CHECK_EQ(key.size(0), query.size(0));
   }
-  if (input_dim == 2) {
+  if (query_dim == 2) {
     CHECK_EQ(query.size(1), p.num_heads * p.head_size);
     CHECK_EQ(key.size(1), p.num_heads_kv * p.head_size);
   }
-  if (input_dim == 3) {
+  if (query_dim == 3) {
     // out-of-place path: align with legacy behavior, no partial rotary
     CHECK_EQ(query.size(-1), rotary_dim);
     CHECK_EQ(key.size(-1), rotary_dim);
     CHECK_EQ(head_size, rotary_dim);
   }
-  if (input_dim == 4) {
+  if (query_dim == 4) {
     CHECK_EQ(query.size(0), key.size(0));
     CHECK_EQ(query.size(1), key.size(1));
   }
 
-  at::Tensor query_out = (input_dim != 3) ? query : at::empty(query.sizes(), query.options());
-  at::Tensor key_out = (input_dim != 3) ? key : at::empty(key.sizes(), key.options());
+  at::Tensor query_out = (query_dim != 3) ? query : at::empty(query.sizes(), query.options());
+  at::Tensor key_out = (query_dim != 3) ? key : at::empty(key.sizes(), key.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
-    AT_DISPATCH_BOOL(input_dim != 3, inplace, [&] {
+    AT_DISPATCH_BOOL(query_dim != 3, inplace, [&] {
       const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
       const int64_t* pos_ptr = positions.data_ptr<int64_t>();
       auto cache_pos = [cache_base, pos_ptr, rotary_dim](int64_t token) -> const scalar_t* {

@@ -281,37 +281,43 @@ class TestROPE(CustomTestCase):
             enable_autocast = True
 
             with torch.no_grad(), torch.amp.autocast("cpu", enabled=enable_autocast):
-                q = torch.randn(seq_len, num_head, q_head_dim, dtype=dtype)
-                q_clone = q.clone()
-                k = torch.randn(seq_len, 1, k_dim, dtype=dtype)
-                k_clone = k.clone()
-                _, q_pe = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
-                _, q_pe_clone = q_clone.split(
-                    [qk_nope_head_dim, qk_rope_head_dim], dim=-1
-                )
-                k_pe = k[:, :, k_dim - qk_rope_head_dim :]
-                k_pe_clone = k_clone[:, :, k_dim - qk_rope_head_dim :]
+                # k_pe_is_2d covers the 3D q_pe with 2D k_pe MLA input shape.
+                for k_pe_is_2d in [False, True]:
+                    q = torch.randn(seq_len, num_head, q_head_dim, dtype=dtype)
+                    q_clone = q.clone()
+                    k = torch.randn(seq_len, 1, k_dim, dtype=dtype)
+                    k_clone = k.clone()
+                    _, q_pe = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
+                    _, q_pe_clone = q_clone.split(
+                        [qk_nope_head_dim, qk_rope_head_dim], dim=-1
+                    )
+                    k_pe = k[:, :, k_dim - qk_rope_head_dim :]
+                    k_pe_clone = k_clone[:, :, k_dim - qk_rope_head_dim :]
+                    if k_pe_is_2d:
+                        k_pe_clone = k_pe_clone.squeeze(1)
 
-                # ref kernel
-                q_pe, k_pe = rope.forward_native(
-                    query=q_pe,
-                    key=k_pe,
-                    positions=positions,
-                )
+                    # ref kernel uses 3D key; DeepseekScalingRotaryEmbedding.forward_native
+                    # broadcasts cos/sin assuming a heads dim and doesn't support 2D key.
+                    q_pe, k_pe = rope.forward_native(
+                        query=q_pe,
+                        key=k_pe,
+                        positions=positions,
+                    )
 
-                # fused rope kernel
-                q_pe_clone, k_pe_clone = torch.ops.sgl_kernel.rotary_embedding_cpu(
-                    positions,
-                    q_pe_clone,
-                    k_pe_clone,
-                    rope.head_size,
-                    cos_sin_cache,
-                    False,
-                )
+                    # fused rope kernel
+                    q_pe_clone, k_pe_clone = torch.ops.sgl_kernel.rotary_embedding_cpu(
+                        positions,
+                        q_pe_clone,
+                        k_pe_clone,
+                        rope.head_size,
+                        cos_sin_cache,
+                        False,
+                    )
 
-                atol = rtol = precision[q_pe.dtype]
-                torch.testing.assert_close(q_pe, q_pe_clone, atol=atol, rtol=rtol)
-                torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
+                    atol = rtol = precision[q_pe.dtype]
+                    torch.testing.assert_close(q_pe, q_pe_clone, atol=atol, rtol=rtol)
+                    k_pe_expected = k_pe.squeeze(1) if k_pe_is_2d else k_pe
+                    torch.testing.assert_close(k_pe_expected, k_pe_clone, atol=atol, rtol=rtol)
 
     def test_origin_rope(self):
         def single_test(
