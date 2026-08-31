@@ -256,7 +256,22 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal);
+    bool causal,
+    double sm_scale);
+
+// DSA MHA_ONE_SHOT support (dense attention over prefix+extend KV already
+// materialized by the caller; no KV-cache indirection)
+at::Tensor create_flashinfer_kv_indices_cpu(
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& page_kernel_lens,
+    const at::Tensor& kv_indptr,
+    const std::optional<at::Tensor>& kv_start_idx);
+
+at::Tensor dequantize_k_cache_paged_cpu(
+    const at::Tensor& quant_k_cache,
+    const at::Tensor& page_table_1_flattened,
+    int64_t group_size);
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -960,8 +975,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // flash attn
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
+      "int max_seqlen_q, int max_seqlen_k, bool causal, float sm_scale=-1.0) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
+
+  m.def(
+      "create_flashinfer_kv_indices_cpu(Tensor req_to_token, Tensor req_pool_indices, Tensor page_kernel_lens, "
+      "Tensor kv_indptr, Tensor? kv_start_idx) -> Tensor");
+  m.impl("create_flashinfer_kv_indices_cpu", torch::kCPU, &create_flashinfer_kv_indices_cpu);
+
+  m.def(
+      "dequantize_k_cache_paged_cpu(Tensor quant_k_cache, Tensor page_table_1_flattened, int group_size) -> Tensor");
+  m.impl("dequantize_k_cache_paged_cpu", torch::kCPU, &dequantize_k_cache_paged_cpu);
 
   // linear attn
   m.def(
