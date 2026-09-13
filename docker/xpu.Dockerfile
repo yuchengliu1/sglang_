@@ -22,7 +22,7 @@ USER root
 ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
 ARG IGC_VERSION=2.34.4+21428
 ARG GMM_VERSION=22.10.0
-
+RUN echo 'Acquire::Check-Date "false";' > /etc/apt/apt.conf.d/99no-check-date
 RUN apt-get update && apt-get install -y software-properties-common curl && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update && \
@@ -70,31 +70,9 @@ ENV VIRTUAL_ENV="/opt/venv"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
+ENV http_proxy=http://proxy.ims.intel.com:911
+ENV https_proxy=http://proxy.ims.intel.com:911
+ENV no_proxy=localhost,127.0.0.1
 WORKDIR /sgl-workspace
-
-RUN pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
-    pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
-
-RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
-    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
-    git -C sglang fetch --tags --force origin && \
-    cd sglang && cd python && \
-    cp pyproject_xpu.toml pyproject.toml && \
-    pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip install --no-cache-dir --no-deps xgrammar==0.1.33
-
-# Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
-# XPU ships no prebuilt wheel: it is built from source against the local oneAPI +
-# torch-XPU runtime (the .so links libsycl.so.<N>, which must match the installed
-# intel-sycl-rt). TMS_PLATFORM=xpu forces the XPU backend; --no-build-isolation
-# lets the build import the installed torch (above) so it can match the libsycl
-# major to it -- under build isolation torch is absent and the match is skipped.
-# Pinned (v0.0.10b2) so image builds are reproducible; bump via --build-arg.
-ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
-# Base image already applies setvars.sh in its own layers (SETVARS_COMPLETED=1,
-# icpx on PATH, LIBRARY_PATH/CPATH populated), so re-sourcing here is redundant.
-RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
-    git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
 CMD ["bash"]
