@@ -81,7 +81,7 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git -C sglang fetch --tags --force origin && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
-    pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://sgl-project.github.io/whl/xpu/ && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
 # Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
