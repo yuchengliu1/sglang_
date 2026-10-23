@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
+    CompressedTensorsW8A16Fp8MoE,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
@@ -75,12 +76,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -411,6 +413,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                     f"Quantization scheme requiring compute capability "
                     f"{min_capability} is not supported on XPU."
                 )
+            return False
+
+        if _is_cpu:
+            # No CUDA device to query; treat as unsupported so callers fall back
+            # to the weight-only (W8A16) scheme instead of touching torch.cuda.*.
             return False
 
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
@@ -974,6 +981,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
             return CompressedTensorsW4A16Nvfp4MoE(has_input_global_scale=True)
         elif self._is_fp8_w8a8(weight_quant, input_quant):
+            if _is_cpu:
+                logger.info_once("Using CompressedTensorsW8A16Fp8MoE (CPU fallback)")
+                return CompressedTensorsW8A16Fp8MoE(weight_quant, input_quant)
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
@@ -1087,7 +1097,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     f"{scheme.__class__.__name__} is not supported on XPU "
                     "(no XPU kernel implementation)."
                 )
-        elif not _is_npu:
+        elif not _is_npu and not _is_cpu:
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
